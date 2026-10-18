@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  # ------------------------------------------------------------------
+  # PostgreSQL avec l'extension pgvector
+  # ------------------------------------------------------------------
+  encheres_postgres:
+    image: pgvector/pgvector:pg16
+    container_name: encheres_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: encheres_db
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # Redis (cache & Pub/Sub)
+  # ------------------------------------------------------------------
+  encheres_redis:
+    image: redis:7-alpine
+    container_name: encheres_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # Backend FastAPI (Python 3.11, async)
+  # ------------------------------------------------------------------
+  encheres_backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: encheres_backend
+    restart: unless-stopped
+    depends_on:
+      encheres_postgres:
+        condition: service_healthy
+      encheres_redis:
+        condition: service_healthy
+    environment:
+      - POSTGRES_SERVER=encheres_postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=encheres_db
+      - REDIS_HOST=encheres_redis
+      - REDIS_PORT=6379
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - SECRET_KEY=${SECRET_KEY:-change_this_to_a_super_secret_key_in_production_min_32_chars}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
