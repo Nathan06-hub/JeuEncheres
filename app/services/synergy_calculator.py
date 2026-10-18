@@ -1,3 +1,4 @@
+﻿# -*- coding: utf-8 -*-
 import uuid
 from typing import List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +10,21 @@ from app.models.deck import Deck, DeckItem
 
 class SynergyCalculator:
     """Calculates team composition synergies and ROI for Screen 04 Results."""
+
+    @staticmethod
+    def _cosine_similarity(vec_a: Any, vec_b: Any) -> float:
+        """Calcule la similarite cosinus entre deux vecteurs d'embeddings (768-dim)."""
+        if not vec_a or not vec_b:
+            return 0.0
+        try:
+            dot = sum(a * b for a, b in zip(vec_a, vec_b))
+            norm_a = sum(a * a for a in vec_a) ** 0.5
+            norm_b = sum(b * b for b in vec_b) ** 0.5
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+        except Exception:
+            return 0.0
 
     @classmethod
     async def compute_game_results(
@@ -32,7 +48,7 @@ class SynergyCalculator:
 
         compositions = []
 
-        # Une seule requête pour toutes les cartes remportées (évite 1 requête par joueur)
+        # Une seule requete pour toutes les cartes remportees
         all_pairs_res = await session.execute(
             select(DraftedItem, DeckItem)
             .join(DeckItem, DraftedItem.item_id == DeckItem.id)
@@ -77,9 +93,9 @@ class SynergyCalculator:
                     bonus = count * 5
                     synergy_bonus += bonus
                     synergies_breakdown.append({
-                        "name": f"Synergie Thématique: {cat}",
+                        "name": f"Synergie Thematique: {cat}",
                         "bonus": bonus,
-                        "description": f"{count} items de la même catégorie ({cat})",
+                        "description": f"{count} items de la meme categorie ({cat})",
                     })
 
             # 2. High Rarity synergy: +20 pts if 2+ Epics/Legendaries
@@ -88,9 +104,9 @@ class SynergyCalculator:
                 bonus = elite_count * 10
                 synergy_bonus += bonus
                 synergies_breakdown.append({
-                    "name": "Synergie Élite",
+                    "name": "Synergie Elite",
                     "bonus": bonus,
-                    "description": f"{elite_count} cartes Épiques ou Légendaires",
+                    "description": f"{elite_count} cartes Epiques ou Legendaires",
                 })
 
             # 3. Clue 1 Bravery bonus: reward winning on subtle 1st clue!
@@ -101,8 +117,27 @@ class SynergyCalculator:
                 synergies_breakdown.append({
                     "name": "Instinct Pur",
                     "bonus": bonus,
-                    "description": f"{clue1_wins} enchères gagnées dès le 1er indice",
+                    "description": f"{clue1_wins} encheres gagnees des le 1er indice",
                 })
+
+            # 4. Semantic Coherence bonus: reward thematic closeness via pgvector embeddings
+            embedded_items = [item for _, item in pairs if getattr(item, "embedding", None) is not None]
+            if len(embedded_items) >= 2:
+                sims = []
+                for i in range(len(embedded_items)):
+                    for j in range(i + 1, len(embedded_items)):
+                        sim = cls._cosine_similarity(embedded_items[i].embedding, embedded_items[j].embedding)
+                        sims.append(sim)
+                if sims:
+                    avg_sim = sum(sims) / len(sims)
+                    if avg_sim >= 0.65:
+                        bonus = int(round(avg_sim * 20))
+                        synergy_bonus += bonus
+                        synergies_breakdown.append({
+                            "name": "Harmonie Semantique",
+                            "bonus": bonus,
+                            "description": f"Deck a forte coherence semantique ({int(avg_sim * 100)}% de proximite vectorielle)",
+                        })
 
             # Update player stats
             p.synergy_bonus = synergy_bonus
@@ -138,7 +173,7 @@ class SynergyCalculator:
 
         return {
             "session_id": str(game.id),
-            "deck_title": deck.title if deck else "Thème",
+            "deck_title": deck.title if deck else "Theme",
             "total_rounds": game.total_rounds,
             "podium": [
                 {

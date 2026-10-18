@@ -33,6 +33,9 @@ export interface HomeScreenProps {
   onStartOnlineGame: (deck: Deck, sessionId?: string, roomCode?: string) => void;
 }
 
+const generateFallbackRoomCode = (): string => Math.random().toString(36).substring(2, 8).toUpperCase();
+const generateFallbackRoomId = (): string => `online-room-${Date.now()}`;
+
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   tokensCount,
   playerName = 'Alex',
@@ -140,14 +143,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         setCreatedRoom({ id: res.id, code: res.code });
       } else {
         // Fallback simulated room code
-        const fallbackCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-        setCreatedRoom({ id: 'online-temp-id', code: fallbackCode });
+        setCreatedRoom({ id: 'online-temp-id', code: generateFallbackRoomCode() });
       }
     } catch (err: any) {
       console.warn('Erreur création salon en ligne:', err);
       // Fallback gracieux en environnement de test
-      const fallbackCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      setCreatedRoom({ id: 'online-room-' + Date.now(), code: fallbackCode });
+      setCreatedRoom({ id: generateFallbackRoomId(), code: generateFallbackRoomCode() });
     } finally {
       setIsSubmittingOnline(false);
     }

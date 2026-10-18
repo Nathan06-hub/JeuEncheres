@@ -1,34 +1,35 @@
+﻿# -*- coding: utf-8 -*-
 import uuid
-from typing import Any
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Any, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from pydantic import BaseModel, Field
 from app.core.database import get_db
-from app.core.websocket_manager import ws_manager
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.game import GameSession, GameSessionPlayer, GameStatus
+from app.models.game import GameSession, GameStatus, GameSessionPlayer
 from app.models.deck import DeckItem
 from app.schemas.game import GameSessionCreate, GameSessionResponse
 from app.schemas.bid import BidSubmitRequest, BidResponse
 from app.services.auction_engine import AuctionEngine
 from app.services.timer_manager import timer_manager
+from app.api.v1.endpoints.auction_ws import ws_manager
 
 router = APIRouter()
 
 
 async def _get_game_or_404(session: AsyncSession, session_id: uuid.UUID) -> GameSession:
-    game = (await session.execute(select(GameSession).where(GameSession.id == session_id))).scalar_one_or_none()
+    game_res = await session.execute(select(GameSession).where(GameSession.id == session_id))
+    game = game_res.scalar_one_or_none()
     if not game:
-        raise HTTPException(status_code=404, detail="Session introuvable")
+        raise HTTPException(status_code=404, detail="Session d'enchères introuvable")
     return game
 
 
 async def _ensure_participant(session: AsyncSession, game: GameSession, user: User) -> None:
-    """403 si l'utilisateur n'est ni l'hôte ni un joueur de la partie."""
-    if game.host_id == user.id or user.is_superuser:
+    if game.host_id == user.id:
         return
     row = (await session.execute(
         select(GameSessionPlayer.id).where(
@@ -61,6 +62,10 @@ async def create_session(
     )
     await session.commit()
     await session.refresh(game)
+    players_res = await session.execute(
+        select(GameSessionPlayer).where(GameSessionPlayer.session_id == game.id)
+    )
+    game.players = list(players_res.scalars().all())
     return game
 
 
@@ -159,7 +164,6 @@ async def place_bid(
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    # Le joueur lié au compte, ou un joueur local (sans compte) d'une partie dont on est l'hôte
     await AuctionEngine.authorize_player(session, session_id, payload.player_id, current_user.id)
 
     bid = await AuctionEngine.submit_bid(
@@ -203,7 +207,6 @@ async def advance_auction(
     )
     await session.commit()
 
-    # Resynchronise le timer serveur et les clients avec le nouvel état
     sess_str = str(session_id)
     if result["action"] == "next_clue":
         await ws_manager.broadcast(sess_str, {
@@ -228,23 +231,11 @@ async def advance_auction(
     return result
 
 
-class JoinSessionRequest(BaseModel):
-    code: str = Field(..., min_length=4, max_length=12, description="Code unique de la session")
-
-
-@router.post("/sessions/join", response_model=GameSessionResponse, summary="Rejoindre un salon en ligne avec un code")
-async def join_session_by_code(
-    payload: JoinSessionRequest,
-    session: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> Any:
-    code_clean = payload.code.strip().upper()
-    game_res = await session.execute(
-        select(GameSession).where(GameSession.code == code_clean)
-    )
-    game = game_res.scalar_one_or_none()
-    if not game:
-        raise HTTPException(status_code=404, detail="Salon introuvable avec ce code")
+async def _process_join_game(
+    session: AsyncSession,
+    game: GameSession,
+    current_user: User,
+) -> GameSession:
     if game.status in (GameStatus.FINISHED, GameStatus.CANCELLED):
         raise HTTPException(status_code=400, detail="Cette partie est déjà terminée")
 
@@ -255,7 +246,11 @@ async def join_session_by_code(
         )
     )
     existing_player = existing_player_res.scalar_one_or_none()
+
     if not existing_player:
+        if game.status != GameStatus.LOBBY:
+            raise HTTPException(status_code=400, detail="La partie a déjà commencé")
+
         count_res = await session.execute(
             select(func.count(GameSessionPlayer.id)).where(GameSessionPlayer.session_id == game.id)
         )
@@ -287,3 +282,43 @@ async def join_session_by_code(
     )
     game.players = list(players_res.scalars().all())
     return game
+
+
+class JoinSessionRequest(BaseModel):
+    code: str = Field(..., min_length=4, max_length=12, description="Code unique de la session")
+
+
+@router.post("/sessions/join", response_model=GameSessionResponse, summary="Rejoindre un salon en ligne avec un code")
+async def join_session_by_code(
+    payload: JoinSessionRequest,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    code_clean = payload.code.strip().upper()
+    game_res = await session.execute(
+        select(GameSession).where(GameSession.code == code_clean)
+    )
+    game = game_res.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Salon introuvable avec ce code")
+    return await _process_join_game(session, game, current_user)
+
+
+@router.post("/sessions/{session_id}/join", response_model=GameSessionResponse, summary="Rejoindre un salon en ligne via son ID")
+async def join_session_by_id(
+    session_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    game = await _get_game_or_404(session, session_id)
+    return await _process_join_game(session, game, current_user)
+
+
+@router.post("/quick-game", response_model=GameSessionResponse, summary="📱 Lancement Partie Rapide (Local / Pass & Play)")
+async def launch_quick_game_alias(
+    deck_id: Optional[uuid.UUID] = None,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    from app.api.v1.endpoints.home import launch_quick_game
+    return await launch_quick_game(deck_id=deck_id, session=session, current_user=current_user)

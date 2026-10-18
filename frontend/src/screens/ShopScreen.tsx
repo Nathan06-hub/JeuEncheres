@@ -1,4 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+
+const generateTxId = (): string => `iap_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 import { Zap, Video } from 'lucide-react';
 import { ScreenId, ShopPack, Transaction } from '../models';
 import { TopBar } from '../widgets/TopBar';
@@ -53,9 +55,9 @@ export const ShopScreen: React.FC<ShopScreenProps> = ({
     };
   }, []);
 
-  const handleBuyPack = async (pack: ShopPack) => {
+  const handleBuyPack = useCallback(async (pack: ShopPack) => {
     const total = pack.tokens + (pack.bonusTokens || 0);
-    const txId = `iap_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const txId = generateTxId();
     try {
       await verifyIapApi(pack.sku || pack.id, txId);
       onAddTokens(total, `Achat Pack ${pack.tokens} Jetons (${pack.price})`);
@@ -66,7 +68,7 @@ export const ShopScreen: React.FC<ShopScreenProps> = ({
       // Priorité 3 : Suppression du contournement boutique. Aucun jeton n'est crédité en cas d'échec serveur.
       alert(`❌ Échec de l'achat : ${err.message || 'Paiement non vérifié par le serveur.'}`);
     }
-  };
+  }, [onAddTokens]);
 
   const handleWatchAd = async () => {
     setIsWatchingAd(true);
