@@ -96,3 +96,21 @@ async def test_websocket_manager_redis_pubsub_listener(monkeypatch):
 
     ws_manager.disconnect(session_id, fake_socket)
     assert session_id not in ws_manager.pubsub_tasks
+
+
+@pytest.mark.asyncio
+async def test_websocket_ticket_flow():
+    from app.api.v1.endpoints.auction_ws import _memory_ws_tickets, _consume_ws_ticket, create_ws_ticket
+    from app.models.user import User
+
+    fake_user = User(id=uuid.uuid4(), username="ws_user", email="ws@test.com")
+    ticket_resp = await create_ws_ticket(fake_user)
+    assert ticket_resp.ticket.startswith("wst_")
+
+    # Consuming valid ticket succeeds
+    uid = await _consume_ws_ticket(ticket_resp.ticket)
+    assert uid == fake_user.id
+
+    # Single-use: consuming again returns None
+    uid_second = await _consume_ws_ticket(ticket_resp.ticket)
+    assert uid_second is None

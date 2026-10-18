@@ -27,7 +27,54 @@ EMBEDDING_TIMEOUT_SECONDS = 15.0
 
 # Générations en cours par utilisateur (process local) : empêche de lancer N générations Gemini
 # en parallèle avec un seul jeton (les débits suivants échoueraient *après* avoir coûté un appel IA).
+# Repli local si Redis est indisponible
 _generations_in_flight: Set[uuid.UUID] = set()
+GENERATION_LOCK_TTL_SECONDS = 60
+
+
+async def _acquire_generation_lock(user_id: uuid.UUID, ttl_seconds: int = GENERATION_LOCK_TTL_SECONDS) -> tuple[bool, str]:
+    token = uuid.uuid4().hex
+    lock_key = f"lock:deck_generation:{user_id}"
+    from app.core import redis as redis_module
+    client = redis_module.redis_client
+    if client is not None:
+        try:
+            acquired = await client.set(lock_key, token, nx=True, ex=ttl_seconds)
+            if not acquired:
+                return False, ""
+            return True, token
+        except Exception as exc:
+            logger.warning("Verrou Redis indisponible pour %s, repli memoire: %s", lock_key, exc)
+
+    if user_id in _generations_in_flight:
+        return False, ""
+    _generations_in_flight.add(user_id)
+    return True, "memory"
+
+
+async def _release_generation_lock(user_id: uuid.UUID, lock_token: str) -> None:
+    if not lock_token:
+        return
+    if lock_token == "memory":
+        _generations_in_flight.discard(user_id)
+        return
+
+    lock_key = f"lock:deck_generation:{user_id}"
+    from app.core import redis as redis_module
+    client = redis_module.redis_client
+    if client is not None:
+        try:
+            lua_release = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """
+            await client.eval(lua_release, 1, lock_key, lock_token)
+        except Exception as exc:
+            logger.warning("Erreur liberation verrou Redis pour %s: %s", lock_key, exc)
+    _generations_in_flight.discard(user_id)
 
 
 class _AIItem(BaseModel):
@@ -97,9 +144,9 @@ async def generate_ai_deck(
     user_id = current_user.id
     cost = settings.AI_DECK_CREATION_TOKEN_COST
 
-    if user_id in _generations_in_flight:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Une génération est déjà en cours")
-    _generations_in_flight.add(user_id)
+    lock_acquired, lock_token = await _acquire_generation_lock(user_id)
+    if not lock_acquired:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Une generation est deja en cours")
     try:
         # 1. Vérifie le solde, puis RELÂCHE la connexion DB avant l'appel IA (jusqu'à 25 s) :
         #    sinon chaque génération immobilise une connexion du pool pendant tout l'appel.
@@ -196,4 +243,4 @@ async def generate_ai_deck(
         deck.items = list(deck_items_res.scalars().all())
         return deck
     finally:
-        _generations_in_flight.discard(user_id)
+        await _release_generation_lock(user_id, lock_token)

@@ -3,7 +3,12 @@ import json
 import uuid
 import logging
 import jwt
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
+import time
+from typing import Optional
+from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query, Depends
+from app.api.deps import get_current_user
+from app.models.user import User
 from sqlalchemy import select
 from app.core.websocket_manager import ws_manager
 from app.core.database import AsyncSessionLocal
@@ -19,6 +24,61 @@ router = APIRouter()
 MAX_MESSAGE_BYTES = 2048
 IDLE_TIMEOUT_SECONDS = 60
 MAX_MESSAGES_PER_SECOND = 10
+WS_TICKET_TTL_SECONDS = 60
+
+_memory_ws_tickets: dict[str, tuple[uuid.UUID, float]] = {}
+
+
+class WsTicketResponse(BaseModel):
+    ticket: str
+    expires_in: int = WS_TICKET_TTL_SECONDS
+
+
+@router.post(
+    "/ws-ticket",
+    response_model=WsTicketResponse,
+    summary="Generer un ticket a usage unique pour connexion WebSocket (evite d exposer le JWT en URL)",
+)
+async def create_ws_ticket(current_user: User = Depends(get_current_user)) -> WsTicketResponse:
+    ticket = f"wst_{uuid.uuid4().hex}"
+    from app.core import redis as redis_module
+    client = redis_module.redis_client
+    if client is not None:
+        try:
+            await client.set(f"ws_ticket:{ticket}", str(current_user.id), ex=WS_TICKET_TTL_SECONDS)
+            return WsTicketResponse(ticket=ticket)
+        except Exception as exc:
+            logger.warning("Erreur stockage ticket Redis: %s", exc)
+
+    _memory_ws_tickets[ticket] = (current_user.id, time.monotonic() + WS_TICKET_TTL_SECONDS)
+    return WsTicketResponse(ticket=ticket)
+
+
+async def _consume_ws_ticket(ticket: str) -> Optional[uuid.UUID]:
+    if not ticket:
+        return None
+    from app.core import redis as redis_module
+    client = redis_module.redis_client
+    if client is not None:
+        try:
+            lua_getdel = """
+            local val = redis.call('get', KEYS[1])
+            if val then
+                redis.call('del', KEYS[1])
+            end
+            return val
+            """
+            val = await client.eval(lua_getdel, 1, f"ws_ticket:{ticket}")
+            if val:
+                return uuid.UUID(str(val))
+        except Exception as exc:
+            logger.warning("Erreur validation ticket Redis: %s", exc)
+
+    if ticket in _memory_ws_tickets:
+        uid, expires_at = _memory_ws_tickets.pop(ticket)
+        if time.monotonic() <= expires_at:
+            return uid
+    return None
 
 
 def _error_payload(exc: Exception) -> dict:
@@ -52,7 +112,8 @@ async def _snapshot(session_uuid: uuid.UUID) -> dict | None:
 async def auction_websocket(
     websocket: WebSocket,
     session_id: str,
-    token: str = Query(None),
+    token: Optional[str] = Query(None),
+    ticket: Optional[str] = Query(None),
 ):
     """📱 Écran 03 : WebSocket temps réel pour timer, révélation d'indices et enchères en direct."""
     try:
@@ -62,14 +123,30 @@ async def auction_websocket(
         await websocket.close(code=4400)
         return
 
-    if not token:
-        await websocket.close(code=4401)
-        return
+    # Extraction depuis subprotocol si fourni
+    subprotocols = websocket.headers.get("sec-websocket-protocol", "")
+    for proto in [p.strip() for p in subprotocols.split(",") if p.strip()]:
+        if proto.startswith("ticket."):
+            ticket = proto.split("ticket.", 1)[1]
+            break
+        elif proto.startswith("bearer."):
+            token = proto.split("bearer.", 1)[1]
+            break
 
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_uuid = uuid.UUID(str(payload.get("sub")))
-    except (jwt.PyJWTError, ValueError, TypeError):
+    user_uuid: Optional[uuid.UUID] = None
+    if ticket:
+        user_uuid = await _consume_ws_ticket(ticket)
+        if user_uuid is None:
+            await websocket.close(code=4401)
+            return
+    elif token:
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+            user_uuid = uuid.UUID(str(payload.get("sub")))
+        except (jwt.PyJWTError, ValueError, TypeError):
+            await websocket.close(code=4401)
+            return
+    else:
         await websocket.close(code=4401)
         return
 
