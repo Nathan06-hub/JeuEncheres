@@ -41,7 +41,8 @@ class ConnectionManager:
         from app.core.redis import redis_client
         if redis_client is None:
             return
-        if session_id in self.pubsub_tasks:
+        existing_task = self.pubsub_tasks.get(session_id)
+        if existing_task is not None and not existing_task.done():
             return
 
         async def _listen():
@@ -65,7 +66,9 @@ class ConnectionManager:
                 except Exception:
                     pass
 
-        self.pubsub_tasks[session_id] = asyncio.create_task(_listen())
+        task = asyncio.create_task(_listen())
+        task.add_done_callback(lambda _: self.pubsub_tasks.pop(session_id, None))
+        self.pubsub_tasks[session_id] = task
 
     def _stop_redis_listener(self, session_id: str) -> None:
         """Annule et nettoie la tâche de souscription Redis lorsque la salle devient vide."""
@@ -87,9 +90,11 @@ class ConnectionManager:
             except Exception as exc:
                 logger.warning(f"Redis publish failed: {exc}")
 
-        # 2. Si Redis n'est pas actif ou si aucune tâche d'écoute locale n'est branchée sur cette salle,
+        # 2. Si Redis n'est pas actif ou si la tâche d'écoute locale n'est pas active sur cette salle,
         #    diffuser immédiatement en local.
-        if not published or session_id not in self.pubsub_tasks:
+        listener_task = self.pubsub_tasks.get(session_id)
+        has_active_listener = listener_task is not None and not listener_task.done()
+        if not published or not has_active_listener:
             await self._broadcast_local(session_id, payload)
 
     async def _broadcast_local(self, session_id: str, payload: str) -> None:

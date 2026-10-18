@@ -105,11 +105,12 @@ class GameSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     # Relationships
     host: Mapped["User | None"] = relationship(foreign_keys=[host_id])
-    deck: Mapped["Deck"] = relationship(back_populates="game_sessions")
+    deck: Mapped["Deck"] = relationship(back_populates="game_sessions", lazy="selectin")
     current_item: Mapped["DeckItem | None"] = relationship(foreign_keys=[current_item_id])
     players: Mapped[list["GameSessionPlayer"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
+        lazy="selectin",
         order_by="GameSessionPlayer.final_score.desc()",
     )
     bids: Mapped[list["Bid"]] = relationship(
