@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import uuid
 from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
-from app.api.deps import get_current_user
+from app.core.rate_limit import rate_limit
+from app.core.websocket_manager import ws_manager
+from app.api.deps import get_current_user, get_game_or_404, ensure_participant
 from app.models.user import User
 from app.models.game import GameSession, GameStatus, GameSessionPlayer
 from app.models.deck import DeckItem
@@ -15,30 +17,8 @@ from app.schemas.game import GameSessionCreate, GameSessionResponse
 from app.schemas.bid import BidSubmitRequest, BidResponse
 from app.services.auction_engine import AuctionEngine
 from app.services.timer_manager import timer_manager
-from app.api.v1.endpoints.auction_ws import ws_manager
 
 router = APIRouter()
-
-
-async def _get_game_or_404(session: AsyncSession, session_id: uuid.UUID) -> GameSession:
-    game_res = await session.execute(select(GameSession).where(GameSession.id == session_id))
-    game = game_res.scalar_one_or_none()
-    if not game:
-        raise HTTPException(status_code=404, detail="Session d'enchères introuvable")
-    return game
-
-
-async def _ensure_participant(session: AsyncSession, game: GameSession, user: User) -> None:
-    if game.host_id == user.id:
-        return
-    row = (await session.execute(
-        select(GameSessionPlayer.id).where(
-            GameSessionPlayer.session_id == game.id,
-            GameSessionPlayer.user_id == user.id,
-        ).limit(1)
-    )).first()
-    if not row:
-        raise HTTPException(status_code=403, detail="Vous ne participez pas à cette partie")
 
 
 @router.post("/sessions", response_model=GameSessionResponse, summary="Créer une salle de partie")
@@ -75,7 +55,7 @@ async def start_session(
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    game = await _get_game_or_404(session, session_id)
+    game = await get_game_or_404(session, session_id)
     if game.host_id != current_user.id:
         raise HTTPException(status_code=403, detail="Seul l'hôte peut lancer la partie")
 
@@ -106,8 +86,8 @@ async def get_live_state(
     current_user: User = Depends(get_current_user),
 ) -> Any:
     """Données requises pour le Header LIVE, Timer, Carte centrale (indices secrets révélés selon niveau) et Budgets."""
-    game = await _get_game_or_404(session, session_id)
-    await _ensure_participant(session, game, current_user)
+    game = await get_game_or_404(session, session_id)
+    await ensure_participant(session, game, current_user)
 
     players_res = await session.execute(
         select(GameSessionPlayer).where(GameSessionPlayer.session_id == session_id)
@@ -195,7 +175,7 @@ async def advance_auction(
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    game = await _get_game_or_404(session, session_id)
+    game = await get_game_or_404(session, session_id)
     if game.host_id != current_user.id:
         raise HTTPException(status_code=403, detail="Seul l'hôte peut avancer l'enchère")
 
@@ -233,9 +213,17 @@ async def advance_auction(
 
 async def _process_join_game(
     session: AsyncSession,
-    game: GameSession,
+    game_id: uuid.UUID,
     current_user: User,
 ) -> GameSession:
+    # Verrouille la ligne de la partie pour éviter la course sur la limite de 8 joueurs (F-04)
+    game_res = await session.execute(
+        select(GameSession).where(GameSession.id == game_id).with_for_update()
+    )
+    game = game_res.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Session d'enchères introuvable")
+
     if game.status in (GameStatus.FINISHED, GameStatus.CANCELLED):
         raise HTTPException(status_code=400, detail="Cette partie est déjà terminée")
 
@@ -288,7 +276,12 @@ class JoinSessionRequest(BaseModel):
     code: str = Field(..., min_length=4, max_length=12, description="Code unique de la session")
 
 
-@router.post("/sessions/join", response_model=GameSessionResponse, summary="Rejoindre un salon en ligne avec un code")
+@router.post(
+    "/sessions/join",
+    response_model=GameSessionResponse,
+    summary="Rejoindre un salon en ligne avec un code",
+    dependencies=[Depends(rate_limit("join-session", attempts=10, window=60))],
+)
 async def join_session_by_code(
     payload: JoinSessionRequest,
     session: AsyncSession = Depends(get_db),
@@ -296,12 +289,12 @@ async def join_session_by_code(
 ) -> Any:
     code_clean = payload.code.strip().upper()
     game_res = await session.execute(
-        select(GameSession).where(GameSession.code == code_clean)
+        select(GameSession.id).where(GameSession.code == code_clean)
     )
-    game = game_res.scalar_one_or_none()
-    if not game:
+    game_id = game_res.scalar_one_or_none()
+    if not game_id:
         raise HTTPException(status_code=404, detail="Salon introuvable avec ce code")
-    return await _process_join_game(session, game, current_user)
+    return await _process_join_game(session, game_id, current_user)
 
 
 @router.post("/sessions/{session_id}/join", response_model=GameSessionResponse, summary="Rejoindre un salon en ligne via son ID")
@@ -310,11 +303,15 @@ async def join_session_by_id(
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
-    game = await _get_game_or_404(session, session_id)
-    return await _process_join_game(session, game, current_user)
+    return await _process_join_game(session, session_id, current_user)
 
 
-@router.post("/quick-game", response_model=GameSessionResponse, summary="📱 Lancement Partie Rapide (Local / Pass & Play)")
+@router.post(
+    "/quick-game",
+    response_model=GameSessionResponse,
+    summary="📱 Lancement Partie Rapide (Local / Pass & Play)",
+    dependencies=[Depends(rate_limit("quick-game", attempts=5, window=60))],
+)
 async def launch_quick_game_alias(
     deck_id: Optional[uuid.UUID] = None,
     session: AsyncSession = Depends(get_db),

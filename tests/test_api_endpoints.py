@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import uuid
 import pytest
 import httpx
@@ -220,4 +220,75 @@ async def test_get_home_structures(client: httpx.AsyncClient, db_session: AsyncS
     resp_pop = await client.get("/api/v1/home/decks/popular")
     assert resp_pop.status_code == 200
     assert isinstance(resp_pop.json(), list)
+    assert resp_pop.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp_pop.headers.get("X-Frame-Options") == "DENY"
+    assert "X-Request-ID" in resp_pop.headers
+
+
+@pytest.mark.asyncio
+async def test_legacy_guest_without_secret_is_rejected(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    """M-01: Un compte invite herite sans device_secret_hash ne doit pas adopter le premier secret presente."""
+    legacy_dev_id = f"legacy_dev_{uuid.uuid4().hex[:10]}"
+    legacy_user = User(
+        device_id=legacy_dev_id,
+        device_secret_hash=None,
+        username=f"legacy_{uuid.uuid4().hex[:6]}",
+        token_balance=3,
+    )
+    db_session.add(legacy_user)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/auth/guest-login",
+        json={
+            "device_id": legacy_dev_id,
+            "device_secret": "attacker_secret_123456789012345678901234",
+        },
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_private_deck_idor_protection_on_create_session(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+):
+    """M-03: Impossible de creer une salle sur le deck prive d'un autre utilisateur."""
+    owner = User(username=f"owner_{uuid.uuid4().hex[:6]}", token_balance=3)
+    db_session.add(owner)
+    await db_session.flush()
+
+    private_deck = Deck(
+        creator_id=owner.id,
+        title="Secret Private Deck",
+        slug=f"priv-{uuid.uuid4().hex[:8]}",
+        category=DeckCategory.CINEMA,
+        is_public=False,
+    )
+    db_session.add(private_deck)
+    await db_session.flush()
+    db_session.add(
+        DeckItem(
+            deck_id=private_deck.id,
+            name="Secret Item",
+            clue_1="c1",
+            clue_2="c2",
+            clue_3="c3",
+            base_score=80,
+            rarity=ItemRarity.EPIC,
+        )
+    )
+    await db_session.commit()
+
+    other_headers = await _get_auth_headers(client)
+    resp = await client.post(
+        "/api/v1/auction/sessions",
+        headers=other_headers,
+        json={"deck_id": str(private_deck.id), "player_names": ["Attacker"]},
+    )
+    assert resp.status_code == 403
+
 

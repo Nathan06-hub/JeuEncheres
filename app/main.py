@@ -1,14 +1,39 @@
 import logging
+import logging.config
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import init_db_extensions, engine
+from app.core.exceptions import DomainError
 from app.core.redis import init_redis_pool, close_redis_pool
 from app.api.v1.api import api_router
+
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {
+                "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "standard",
+            }
+        },
+        "root": {
+            "handlers": ["console"],
+            "level": "DEBUG" if settings.DEBUG else "INFO",
+        },
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +53,14 @@ async def lifespan(app: FastAPI):
         await init_redis_pool()
     except Exception:
         logger.exception("Could not connect to Redis pool")
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.api.v1.endpoints.shop import seed_default_token_packs
+        async with AsyncSessionLocal() as session:
+            await seed_default_token_packs(session)
+    except Exception:
+        logger.exception("Could not seed default token packs")
 
     try:
         from app.services.timer_manager import timer_manager
@@ -52,22 +85,40 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    docs_url=f"{settings.API_V1_STR}/docs",
-    redoc_url=f"{settings.API_V1_STR}/redoc",
+    openapi_url=f"{settings.API_V1_STR}/openapi.json" if settings.IS_DEVELOPMENT else None,
+    docs_url=f"{settings.API_V1_STR}/docs" if settings.IS_DEVELOPMENT else None,
+    redoc_url=f"{settings.API_V1_STR}/redoc" if settings.IS_DEVELOPMENT else None,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(DomainError)
+async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+
+@app.middleware("http")
+async def security_and_correlation_headers(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
+    )
+    if not settings.IS_DEVELOPMENT:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    return response
+
 
 # Proxy headers middleware (reverse proxy client IP resolution for rate limiting)
 app.add_middleware(
     ProxyHeadersMiddleware,
-    trusted_hosts=[
-        "127.0.0.1",
-        "::1",
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-    ],
+    trusted_hosts=settings.TRUSTED_PROXY_HOSTS,
 )
 
 # CORS Middleware setup
@@ -76,7 +127,7 @@ app.add_middleware(
     allow_origins=settings.BACKEND_CORS_ORIGINS,
     allow_credentials="*" not in settings.BACKEND_CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 # Mount API v1 router

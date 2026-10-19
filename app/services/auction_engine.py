@@ -1,14 +1,24 @@
 import random
+import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, func
 from fastapi import HTTPException, status
 
+from app.core.config import settings
 from app.models.game import GameSession, GameSessionPlayer, GameStatus, GameMode
 from app.models.deck import Deck, DeckItem
 from app.models.bid import Bid, DraftedItem
+
+_ROOM_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+_ROOM_CODE_LENGTH = 8
+
+
+def _generate_room_code() -> str:
+    return "".join(secrets.choice(_ROOM_CODE_ALPHABET) for _ in range(_ROOM_CODE_LENGTH))
 
 
 class AuctionEngine:
@@ -72,28 +82,56 @@ class AuctionEngine:
         mode: GameMode = GameMode.LOCAL_PASS_AND_PLAY,
     ) -> GameSession:
         """Initialize a new GameSession with players and room code."""
-        # Verify deck exists
+        # Verify deck exists and caller has access (M-03)
         deck_res = await session.execute(select(Deck).where(Deck.id == deck_id))
         deck = deck_res.scalar_one_or_none()
         if not deck:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deck introuvable")
+        if not deck.is_public and (host_user_id is None or deck.creator_id != host_user_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ce deck est privé")
 
-        code = uuid.uuid4().hex[:6].upper()
+        # Plafond de parties actives par hôte (E-02)
+        if host_user_id is not None:
+            active_count_res = await session.execute(
+                select(func.count(GameSession.id)).where(
+                    GameSession.host_id == host_user_id,
+                    GameSession.status == GameStatus.ROUND_BIDDING,
+                )
+            )
+            active_count = active_count_res.scalar() or 0
+            if active_count >= settings.MAX_ACTIVE_GAMES_PER_HOST:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Nombre maximal de parties actives atteint ({settings.MAX_ACTIVE_GAMES_PER_HOST})",
+                )
 
-        game = GameSession(
-            code=code,
-            host_id=host_user_id,
-            deck_id=deck_id,
-            mode=mode,
-            starting_budget=starting_budget,
-            total_rounds=total_rounds,
-            current_round=1,
-            current_clue_level=1,
-            timer_seconds=timer_seconds,
-            status=GameStatus.LOBBY,
-        )
-        session.add(game)
-        await session.flush()
+        # Génération de code de salle 8 caractères base32 avec retry sur collision (F-05)
+        game: Optional[GameSession] = None
+        for _ in range(5):
+            candidate_code = _generate_room_code()
+            candidate = GameSession(
+                code=candidate_code,
+                host_id=host_user_id,
+                deck_id=deck_id,
+                mode=mode,
+                starting_budget=starting_budget,
+                total_rounds=total_rounds,
+                current_round=1,
+                current_clue_level=1,
+                timer_seconds=timer_seconds,
+                status=GameStatus.LOBBY,
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(candidate)
+                    await session.flush()
+                game = candidate
+                break
+            except IntegrityError:
+                continue
+
+        if game is None:
+            raise HTTPException(status_code=500, detail="Impossible de générer un code de salle unique")
 
         # Add players
         for idx, name in enumerate(player_names):

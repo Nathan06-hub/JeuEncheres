@@ -98,7 +98,7 @@ class GeminiService:
                 item["rarity"] = self._calculate_rarity(score)
             return data
         except Exception as exc:
-            logger.error(f"GenAI API error: {exc}.")
+            logger.error("GenAI API error: %s.", exc)
             if settings.IS_DEVELOPMENT:
                 logger.warning("Falling back to mock deck in development.")
                 return self._generate_mock_deck(prompt, category, items_count)
@@ -117,7 +117,7 @@ class GeminiService:
                 return result.embeddings[0].values
             return None
         except Exception as exc:
-            logger.warning(f"Error computing embedding: {exc}")
+            logger.warning("Error computing embedding: %s", exc)
             return None
 
     def _generate_mock_deck(
@@ -127,12 +127,14 @@ class GeminiService:
         items_count: int = 10,
     ) -> Dict[str, Any]:
         cat = category or DeckCategory.POP_CULTURE
+        clean_prompt = prompt.strip() or "Culture Générale"
+        first_word = (clean_prompt.split() or ["draft"])[0].lower()
         sample_items = [
             {
-                "name": f"Chef d'oeuvre #{i+1} : {prompt.title()}",
+                "name": f"Chef d'oeuvre #{i+1} : {clean_prompt.title()}",
                 "clue_1": "Une révélation qui a marqué sa génération lors de sa première apparition.",
                 "clue_2": "Associé à une bande-son culte et un casting récompensé par la critique.",
-                "clue_3": f"Considéré comme la référence ultime dans l'univers de {prompt}.",
+                "clue_3": f"Considéré comme la référence ultime dans l'univers de {clean_prompt}.",
                 "base_score": 50 + (i * 4) % 50,
                 "metadata": {"decade": "90s", "origin": "Universal"},
             }
@@ -143,9 +145,9 @@ class GeminiService:
             item["rarity"] = self._calculate_rarity(item["base_score"])
 
         return {
-            "title": f"Légendes de : {prompt}",
-            "description": f"Deck thématique généré par IA autour de {prompt}.",
+            "title": f"Légendes de : {clean_prompt}",
+            "description": f"Deck thématique généré par IA autour de {clean_prompt}.",
             "category": cat.value,
-            "tags": [cat.value, "Draft", "IA", prompt.split()[0].lower()],
+            "tags": [cat.value, "Draft", "IA", first_word],
             "items": sample_items,
         }

@@ -18,14 +18,17 @@ class ConnectionManager:
         # session_id -> Redis PubSub listener task
         self.pubsub_tasks: Dict[str, asyncio.Task] = {}
 
-    async def connect(self, session_id: str, websocket: WebSocket) -> None:
+    async def connect(self, session_id: str, websocket: WebSocket, subprotocol: str | None = None) -> None:
         """Accept and register WebSocket connection in room."""
-        await websocket.accept()
+        if subprotocol is not None:
+            await websocket.accept(subprotocol=subprotocol)
+        else:
+            await websocket.accept()
         if session_id not in self.active_rooms:
             self.active_rooms[session_id] = set()
             self._start_redis_listener(session_id)
         self.active_rooms[session_id].add(websocket)
-        logger.info(f"WebSocket client connected to room {session_id}. Total: {len(self.active_rooms[session_id])}")
+        logger.info("WebSocket client connected to room %s. Total: %d", session_id, len(self.active_rooms[session_id]))
 
     def disconnect(self, session_id: str, websocket: WebSocket) -> None:
         """Remove disconnected socket."""
@@ -34,7 +37,7 @@ class ConnectionManager:
             if not self.active_rooms[session_id]:
                 del self.active_rooms[session_id]
                 self._stop_redis_listener(session_id)
-        logger.info(f"WebSocket client disconnected from room {session_id}")
+        logger.info("WebSocket client disconnected from room %s", session_id)
 
     def _start_redis_listener(self, session_id: str) -> None:
         """Lance une tâche asynchrone d'écoute Pub/Sub dédiée au canal auction:{session_id}."""
@@ -58,7 +61,7 @@ class ConnectionManager:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.warning(f"Erreur pubsub listener pour {channel}: {exc}")
+                logger.warning("Erreur pubsub listener pour %s: %s", channel, exc)
             finally:
                 try:
                     await pubsub.unsubscribe(channel)
@@ -88,7 +91,7 @@ class ConnectionManager:
                 await redis_client.publish(f"auction:{session_id}", payload)
                 published = True
             except Exception as exc:
-                logger.warning(f"Redis publish failed: {exc}")
+                logger.warning("Redis publish failed: %s", exc)
 
         # 2. Si Redis n'est pas actif ou si la tâche d'écoute locale n'est pas active sur cette salle,
         #    diffuser immédiatement en local.
@@ -108,9 +111,9 @@ class ConnectionManager:
                 # Un client lent ne doit pas bloquer toute la salle
                 await asyncio.wait_for(conn.send_text(payload), timeout=SEND_TIMEOUT_SECONDS)
                 return True
-            except Exception:
+            except Exception as exc:
+                logger.debug("WebSocket send failed in room %s: %s", session_id, exc)
                 return False
-
 
         results = await asyncio.gather(*(_send(c) for c in connections))
 

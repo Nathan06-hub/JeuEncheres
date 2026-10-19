@@ -3,7 +3,6 @@ import {
   DeckCategory,
   DeckItem,
   GameResultsResponse,
-  GameSession,
   ShopPack,
   Transaction,
 } from '../models';
@@ -20,7 +19,17 @@ const STORAGE_KEYS = {
 export function getDeviceId(): string {
   let id = localStorage.getItem(STORAGE_KEYS.DEVICE_ID);
   if (!id) {
-    id = `device_${Math.random().toString(36).substring(2, 10)}_${Date.now().toString(36)}`;
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      id = `device_${crypto.randomUUID()}`;
+    } else {
+      const arr = new Uint8Array(16);
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        crypto.getRandomValues(arr);
+        id = `device_${Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+      } else {
+        id = `device_${Date.now().toString(36)}`;
+      }
+    }
     localStorage.setItem(STORAGE_KEYS.DEVICE_ID, id);
   }
   return id;
@@ -34,7 +43,7 @@ export function getDeviceSecret(): string {
       crypto.getRandomValues(arr);
       secret = Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
     } else {
-      secret = `sec_${Math.random().toString(36).substring(2)}${Date.now()}_longsecretkey32char`;
+      secret = `sec_${Date.now()}_longsecretkey32charactersfallback`;
     }
     localStorage.setItem(STORAGE_KEYS.DEVICE_SECRET, secret);
   }
@@ -88,7 +97,8 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 // Check Backend Health
 export async function checkBackendHealth(): Promise<boolean> {
   try {
-    const res = await fetch('http://localhost:8000/health', { method: 'GET', signal: AbortSignal.timeout(1500) });
+    const healthOrigin = API_BASE_URL.replace(/\/api\/v1\/?$/, '');
+    const res = await fetch(`${healthOrigin}/health`, { method: 'GET', signal: AbortSignal.timeout(1500) });
     return res.ok;
   } catch {
     return false;
@@ -367,7 +377,7 @@ export async function fetchTransactionHistory(): Promise<Transaction[]> {
   }
 }
 
-// WebSocket Connection Helper with Auto-Reconnect & Exponential Backoff
+// WebSocket Connection Helper with Single-Use Ticket, Auto-Reconnect & Exponential Backoff
 export function connectAuctionWs(
   sessionId: string,
   callbacks: {
@@ -377,8 +387,7 @@ export function connectAuctionWs(
     onClose?: (event: CloseEvent) => void;
   }
 ): () => void {
-  const token = getStoredToken();
-  const wsUrl = `ws://localhost:8000/api/v1/auction/ws/${sessionId}?token=${token || ''}`;
+  const wsBaseUrl = API_BASE_URL.replace(/^http/i, 'ws');
 
   let ws: WebSocket | null = null;
   let pingTimer: any = null;
@@ -394,14 +403,20 @@ export function connectAuctionWs(
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(() => {
       if (!isClosedManually) {
-        connect();
+        void connect();
       }
     }, delay);
   }
 
-  function connect() {
+  async function connect() {
     if (isClosedManually) return;
     try {
+      const ticketData = await request<{ ticket: string }>('/auction/ws-ticket', {
+        method: 'POST',
+      });
+      if (isClosedManually) return;
+
+      const wsUrl = `${wsBaseUrl}/auction/ws/${sessionId}?ticket=${encodeURIComponent(ticketData.ticket)}`;
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
@@ -455,7 +470,7 @@ export function connectAuctionWs(
     }
   }
 
-  connect();
+  void connect();
 
   return () => {
     isClosedManually = true;

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pydantic import BaseModel, Field, ConfigDict
 from app.models.token import TokenTransactionType
 
@@ -33,12 +33,12 @@ class TokenPackResponse(BaseModel):
 
 
 class IAPReceiptVerificationRequest(BaseModel):
-    pack_sku: str = Field(..., description="SKU of the purchased pack")
-    platform: str = Field(..., description="'apple' or 'google'")
-    receipt_data: str = Field(..., description="Encrypted receipt payload or token")
-    transaction_id: str = Field(..., description="Store transaction identifier")
+    pack_sku: str = Field(..., min_length=1, max_length=64, description="SKU of the purchased pack")
+    platform: Literal["apple", "google", "ios", "android"] = Field(..., description="'apple' or 'google'")
+    receipt_data: str = Field(..., min_length=1, max_length=16384, description="Encrypted receipt payload or token")
+    transaction_id: str = Field(..., min_length=1, max_length=255, description="Store transaction identifier")
 
 
 class RewardedAdClaimRequest(BaseModel):
-    ad_network: str = Field(default="admob", description="Ad network name")
-    reward_token: str = Field(..., description="Server-to-server or cryptographic reward verification token")
+    ad_network: str = Field(default="admob", min_length=1, max_length=64, description="Ad network name")
+    reward_token: str = Field(..., min_length=1, max_length=255, description="Server-to-server or cryptographic reward verification token")

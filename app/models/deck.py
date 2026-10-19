@@ -28,6 +28,7 @@ class DeckCategory(str, enum.Enum):
 
 class ItemRarity(str, enum.Enum):
     COMMON = "COMMON"        # Score 1-50
+    UNCOMMON = "UNCOMMON"    # Valeur présente en base (0001_initial_schema)
     RARE = "RARE"            # Score 51-75
     EPIC = "EPIC"            # Score 76-90
     LEGENDARY = "LEGENDARY"  # Score 91-100

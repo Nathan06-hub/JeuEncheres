@@ -34,8 +34,13 @@ class UserLogin(BaseModel):
 
 class Token(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: int
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=20, max_length=2048)
 
 
 class UserResponse(BaseModel):

@@ -209,3 +209,4 @@ def downgrade() -> None:
     sa.Enum(name='game_status_enum').drop(op.get_bind(), checkfirst=True)
     sa.Enum(name='game_mode_enum').drop(op.get_bind(), checkfirst=True)
     sa.Enum(name='item_rarity_enum').drop(op.get_bind(), checkfirst=True)
+    sa.Enum(name='deck_category_enum').drop(op.get_bind(), checkfirst=True)

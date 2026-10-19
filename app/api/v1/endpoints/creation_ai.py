@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.rate_limit import rate_limit, enforce_daily_global_quota
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.deck import Deck, DeckItem, DeckCategory
@@ -134,7 +135,12 @@ def _validate_ai_items(raw_items: Any, expected: int) -> List[_AIItem]:
     return valid[:expected]
 
 
-@router.post("/generate", response_model=DeckDetailResponse, summary="📱 Écran 02 : Générer un deck complet via Gemini API (Déduction 1 Jeton)")
+@router.post(
+    "/generate",
+    response_model=DeckDetailResponse,
+    summary="📱 Écran 02 : Générer un deck complet via Gemini API (Déduction 1 Jeton)",
+    dependencies=[Depends(rate_limit("ai-generate", attempts=settings.AI_GENERATE_RATE_LIMIT_PER_MIN, window=60))],
+)
 async def generate_ai_deck(
     payload: DeckGenerateRequest,
     current_user: User = Depends(get_current_user),
@@ -157,6 +163,9 @@ async def generate_ai_deck(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Solde de jetons insuffisant (Requis: {cost}, Actuel: {balance})",
             )
+
+        # Plafond global journalier pour éviter l'emballement de coûts Gemini (C-03)
+        await enforce_daily_global_quota("ai_deck_generation", settings.AI_DAILY_GLOBAL_GENERATION_CAP)
 
         # 2. Appel Gemini (deck + embeddings en parallèle) sous un timeout global
         gemini = GeminiService()
@@ -205,6 +214,7 @@ async def generate_ai_deck(
         if not isinstance(tags, list):
             tags = [cat_str]
 
+        # M-10 : privé par défaut tant que le contenu généré n'est pas modéré/publié explicitement
         deck = Deck(
             creator_id=user_id,
             title=title,
@@ -212,7 +222,7 @@ async def generate_ai_deck(
             description=str(deck_data.get("description") or f"Deck thématique généré par IA autour de : {payload.prompt}")[:2000],
             category=deck_category,
             tags=[str(t)[:50] for t in tags[:10]],
-            is_public=True,
+            is_public=False,
             ai_prompt=payload.prompt,
         )
         session.add(deck)
@@ -237,10 +247,11 @@ async def generate_ai_deck(
         await session.commit()
         await session.refresh(deck)
 
+        from sqlalchemy.orm.attributes import set_committed_value
         deck_items_res = await session.execute(
             select(DeckItem).where(DeckItem.deck_id == deck.id).order_by(DeckItem.base_score.desc())
         )
-        deck.items = list(deck_items_res.scalars().all())
+        set_committed_value(deck, "items", list(deck_items_res.scalars().all()))
         return deck
     finally:
         await _release_generation_lock(user_id, lock_token)

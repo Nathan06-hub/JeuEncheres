@@ -10,12 +10,13 @@ from sqlalchemy import select, or_
 
 from app.core.database import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import create_access_token, aget_password_hash, averify_password
+from app.core.security import create_access_token, create_refresh_token, aget_password_hash, averify_password
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.token import TokenTransaction, TokenTransactionType
-from app.schemas.user import UserCreate, UserGuestLogin, UserResponse, Token
+from app.schemas.user import UserCreate, UserGuestLogin, UserResponse, Token, RefreshTokenRequest
 from app.core.config import settings
+import jwt
 
 router = APIRouter()
 
@@ -27,6 +28,7 @@ def _hash_secret(secret: str) -> str:
 def _token_response(user: User) -> dict[str, Any]:
     return {
         "access_token": create_access_token(subject=str(user.id)),
+        "refresh_token": create_refresh_token(subject=str(user.id)),
         "token_type": "bearer",
         "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     }
@@ -82,11 +84,7 @@ async def guest_login(
             await session.refresh(user)
             return _token_response(user)
 
-    if user.device_secret_hash is None:
-        # Compte invité antérieur à l'introduction du secret : le premier secret présenté est adopté.
-        user.device_secret_hash = secret_hash
-        await session.commit()
-    elif not hmac.compare_digest(user.device_secret_hash, secret_hash):
+    if not user.device_secret_hash or not hmac.compare_digest(user.device_secret_hash, secret_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Identifiants d'appareil invalides")
 
     if not user.is_active:
@@ -174,6 +172,43 @@ async def login_access_token(
     if not user.is_active:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Compte utilisateur inactif")
 
+    return _token_response(user)
+
+
+@router.post(
+    "/refresh",
+    response_model=Token,
+    summary="Renouveler la paire de jetons via un refresh_token valide",
+    dependencies=[Depends(rate_limit("refresh"))],
+)
+async def refresh_access_token(
+    payload: RefreshTokenRequest,
+    session: AsyncSession = Depends(get_db),
+) -> Any:
+    try:
+        decoded = jwt.decode(
+            payload.refresh_token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+            options={"require": ["exp", "sub", "iss", "aud"]},
+        )
+        if decoded.get("type") != "refresh":
+            raise ValueError("Not a refresh token")
+        user_id = uuid.UUID(str(decoded["sub"]))
+    except (jwt.PyJWTError, ValueError, TypeError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Jeton de rafraîchissement invalide ou expiré",
+        )
+
+    user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Utilisateur introuvable ou inactif",
+        )
     return _token_response(user)
 
 

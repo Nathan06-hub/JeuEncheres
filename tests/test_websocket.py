@@ -1,29 +1,37 @@
 import uuid
 import pytest
-from starlette.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
-from app.main import app
+from app.api.v1.endpoints.auction_ws import auction_websocket
 from app.core.websocket_manager import ws_manager
 
 
-def _expect_close(url: str) -> int:
-    client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(url):
-            pass
-    return exc.value.code
+class _CloseCaptureWebSocket:
+    def __init__(self):
+        self.headers: dict[str, str] = {}
+        self.closed_code: int | None = None
+
+    async def close(self, code: int = 1000):
+        self.closed_code = code
 
 
-def test_websocket_rejects_missing_token():
-    assert _expect_close(f"/api/v1/auction/ws/{uuid.uuid4()}") == 4401
+@pytest.mark.asyncio
+async def test_websocket_rejects_missing_token():
+    ws = _CloseCaptureWebSocket()
+    await auction_websocket(ws, session_id=str(uuid.uuid4()), ticket=None, token=None)
+    assert ws.closed_code == 4401
 
 
-def test_websocket_rejects_invalid_token():
-    assert _expect_close(f"/api/v1/auction/ws/{uuid.uuid4()}?token=not-a-jwt") == 4401
+@pytest.mark.asyncio
+async def test_websocket_rejects_invalid_token():
+    ws = _CloseCaptureWebSocket()
+    await auction_websocket(ws, session_id=str(uuid.uuid4()), ticket=None, token="not-a-jwt")
+    assert ws.closed_code == 4401
 
 
-def test_websocket_rejects_malformed_session_id():
-    assert _expect_close("/api/v1/auction/ws/not-a-uuid?token=whatever") == 4400
+@pytest.mark.asyncio
+async def test_websocket_rejects_malformed_session_id():
+    ws = _CloseCaptureWebSocket()
+    await auction_websocket(ws, session_id="not-a-uuid", ticket=None, token="whatever")
+    assert ws.closed_code == 4400
 
 
 class _FakeWebSocket:

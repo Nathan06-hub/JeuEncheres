@@ -15,11 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 class AuctionTimerManager:
-    """Gestionnaire de timers d'encheres distribue (synchronise via Redis avec repli local)."""
+    """Gestionnaire de timers d'encheres distribue (synchronise via Redis avec bail de propriete et repli local)."""
 
     def __init__(self):
         # session_id (str) -> asyncio.Task locale
         self.running_timers: Dict[str, asyncio.Task] = {}
+        self.worker_id: str = uuid.uuid4().hex
 
     def start_round_timer(
         self,
@@ -47,9 +48,47 @@ class AuctionTimerManager:
         if redis_module.redis_client is not None:
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(redis_module.redis_client.delete(f"auction:timer:{sess_str}"))
+                loop.create_task(
+                    redis_module.redis_client.delete(
+                        f"auction:timer:{sess_str}",
+                        f"auction:timer_lease:{sess_str}",
+                    )
+                )
             except RuntimeError:
                 pass
+
+    async def _acquire_or_renew_lease(
+        self,
+        session_id: uuid.UUID,
+        round_number: int,
+        clue_level: int,
+        ttl_seconds: int = 5,
+        force_takeover: bool = False,
+    ) -> bool:
+        """Acquiert ou renouvelle le bail Redis exclusif pour diffuser les tics de cette manche (M-07)."""
+        from app.core import redis as redis_module
+        client = redis_module.redis_client
+        if client is None:
+            return True
+        lease_key = f"auction:timer_lease:{session_id}"
+        lease_val = f"{self.worker_id}:{round_number}:{clue_level}"
+        try:
+            if force_takeover:
+                await client.set(lease_key, lease_val, ex=ttl_seconds)
+                return True
+            lua_lease = """
+            local cur = redis.call('get', KEYS[1])
+            if not cur or cur == ARGV[1] then
+                redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                return 1
+            end
+            return 0
+            """
+            res = await client.eval(lua_lease, 1, lease_key, lease_val, ttl_seconds)
+            return bool(res)
+        except Exception as exc:
+            logger.warning("Echec bail Redis timer pour %s: %s", session_id, exc)
+            return True
 
     async def _sync_timer_state_to_redis(
         self,
@@ -86,11 +125,16 @@ class AuctionTimerManager:
     ) -> None:
         sess_str = str(session_id)
         try:
-            # 1. Enregistre l'etat distribue dans Redis
+            # 1. Acquiert le bail exclusif et enregistre l'etat distribue dans Redis
+            if not await self._acquire_or_renew_lease(session_id, round_number, clue_level, force_takeover=True):
+                return
             await self._sync_timer_state_to_redis(session_id, duration, round_number, clue_level)
 
             # 2. Boucle de tics reguliers
             for remaining in range(duration, -1, -1):
+                if not await self._acquire_or_renew_lease(session_id, round_number, clue_level):
+                    logger.info("Bail timer repris par un autre worker pour %s", sess_str)
+                    return
                 await ws_manager.broadcast(
                     sess_str,
                     {
@@ -198,7 +242,7 @@ class AuctionTimerManager:
                 self.running_timers.pop(sess_str, None)
 
     async def resume_active_games(self) -> int:
-        """Au demarrage: relance le timer des parties restees en ROUND_BIDDING."""
+        """Au demarrage: relance le timer des parties restees en ROUND_BIDDING si aucun autre worker ne detient le bail."""
         from datetime import datetime, timezone
         from sqlalchemy import select
         from app.models.game import GameSession
@@ -210,7 +254,10 @@ class AuctionTimerManager:
             games = list(res.scalars().all())
 
         now = datetime.now(timezone.utc)
+        resumed_count = 0
         for game in games:
+            if not await self._acquire_or_renew_lease(game.id, game.current_round, game.current_clue_level):
+                continue
             deadline = game.round_deadline
             if deadline is not None and deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=timezone.utc)
@@ -221,7 +268,8 @@ class AuctionTimerManager:
                 round_number=game.current_round,
                 clue_level=game.current_clue_level,
             )
-        return len(games)
+            resumed_count += 1
+        return resumed_count
 
 
 timer_manager = AuctionTimerManager()

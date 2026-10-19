@@ -7,8 +7,6 @@ import {
   Check,
   Send,
   Crown,
-  ChevronRight,
-  Flame,
 } from 'lucide-react';
 import { ScreenId, DeckItem, Deck, LocalMatchResults } from '../models';
 import { TopBar } from '../widgets/TopBar';
@@ -98,7 +96,9 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
   const [hasUserPassed, setHasUserPassed] = useState(false);
   const [userBudget, setUserBudget] = useState(1000);
   const [myPlayerId, setMyPlayerId] = useState<string>('p-me');
+  const myPlayerIdRef = useRef<string>('p-me');
   const [onlineParticipants, setOnlineParticipants] = useState<OnlineParticipant[]>([]);
+  const [onlineItem, setOnlineItem] = useState<DeckItem | null>(null);
 
   // Refs for reliable timer cleanup
   const winnerTimeoutRef = useRef<any>(null);
@@ -113,14 +113,19 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
     return mockDeckItems;
   }, [activeDeck]);
 
-  const currentItem: DeckItem = itemsPool[(currentRound - 1) % itemsPool.length] || mockDeckItems[0];
+  const currentItem: DeckItem = (!isLocalMode && onlineItem)
+    ? onlineItem
+    : (itemsPool[(currentRound - 1) % itemsPool.length] || mockDeckItems[0]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (winnerTimeoutRef.current) clearTimeout(winnerTimeoutRef.current);
-      if (turnIntervalRef.current) clearInterval(turnIntervalRef.current);
-      if (finishTimeoutRef.current) clearTimeout(finishTimeoutRef.current);
+      const winnerTimer = winnerTimeoutRef.current;
+      const turnInterval = turnIntervalRef.current;
+      const finishTimer = finishTimeoutRef.current;
+      if (winnerTimer) clearTimeout(winnerTimer);
+      if (turnInterval) clearInterval(turnInterval);
+      if (finishTimer) clearTimeout(finishTimer);
     };
   }, []);
 
@@ -217,6 +222,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
           // Rotate starting player for the new round
           const newStartIdx = currentRound % localPlayersData.length;
           setActivePlayerTurnIndex(newStartIdx);
+          setTurnTimerSeconds(10);
 
           // Transition to the first player of the new round
           setTransitionNextPlayer(localPlayersData[newStartIdx]);
@@ -262,6 +268,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
         setTransitionNextPlayer(nextPlayer);
         setIsTransitioning(true); // Affiche "Passe le téléphone à [Joueur Suivant]"
         setActivePlayerTurnIndex(nextIdx);
+        setTurnTimerSeconds(10);
         setCustomBidAmount('');
         setShowCustomInput(false);
       } else {
@@ -298,8 +305,6 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
       if (turnIntervalRef.current) clearInterval(turnIntervalRef.current);
       return;
     }
-
-    setTurnTimerSeconds(10);
 
     if (turnIntervalRef.current) clearInterval(turnIntervalRef.current);
     turnIntervalRef.current = setInterval(() => {
@@ -374,37 +379,64 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
   // =========================================================================
   // ONLINE WEBSOCKET INTEGRATION
   // =========================================================================
-  useEffect(() => {
-    if (isLocalMode || !sessionId) return;
-
-    // Fetch initial state via REST
-    fetchAuctionLiveState(sessionId)
+  const syncOnlineLiveState = useCallback((sid: string) => {
+    fetchAuctionLiveState(sid)
       .then((state) => {
-        if (state) {
-          setCurrentRound(state.current_round || 1);
-          setTotalRounds(state.total_rounds || 5);
-          setOnlineClueLevel(state.current_clue_level || 1);
-          if (state.timer_seconds) setOnlineTimerSeconds(state.timer_seconds);
-          if (state.players && state.players.length > 0) {
-            setOnlineParticipants(
-              state.players.map((p: any) => ({
-                id: p.id,
-                name: p.display_name,
-                cash: p.remaining_budget,
-                hasPassed: false,
-                isHost: p.is_host,
-              }))
-            );
+        if (!state) return;
+        setCurrentRound(state.current_round || 1);
+        setTotalRounds(state.total_rounds || 5);
+        setOnlineClueLevel(state.current_clue_level || 1);
+        if (state.timer_seconds) setOnlineTimerSeconds(state.timer_seconds);
+        if (state.item) {
+          setOnlineItem({
+            id: state.item.id,
+            name: state.item.name || '???',
+            clue1: state.item.clue_1 || '',
+            clue2: state.item.clue_2 || '',
+            clue3: state.item.clue_3 || '',
+            score: state.item.base_score || 0,
+            rarity: 'rare',
+            category: state.item.category || 'POP_CULTURE',
+          });
+        }
+        if (state.players && state.players.length > 0) {
+          setOnlineParticipants(
+            state.players.map((p: any) => ({
+              id: p.id,
+              name: p.display_name,
+              cash: p.remaining_budget,
+              hasPassed: false,
+              isHost: p.is_host,
+            }))
+          );
+          const me = state.players.find((p: any) => p.id === myPlayerIdRef.current);
+          if (me && typeof me.remaining_budget === 'number') {
+            setUserBudget(me.remaining_budget);
           }
         }
       })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (isLocalMode || !sessionId) return;
+
+    // Fetch initial state via REST
+    syncOnlineLiveState(sessionId);
 
     // Open real-time WebSocket connection
     const cleanupWs = connectAuctionWs(sessionId, {
       onMessage: (msg) => {
         if (msg.type === 'CONNECTED') {
-          if (msg.player_id) setMyPlayerId(msg.player_id);
+          if (msg.player_id) {
+            myPlayerIdRef.current = msg.player_id;
+            setMyPlayerId(msg.player_id);
+          }
+        } else if (msg.type === 'STATE_SNAPSHOT') {
+          if (msg.round) setCurrentRound(msg.round);
+          if (msg.total_rounds) setTotalRounds(msg.total_rounds);
+          if (msg.clue_level) setOnlineClueLevel(msg.clue_level);
+          syncOnlineLiveState(sessionId);
         } else if (msg.type === 'PLAYER_JOINED') {
           setOnlineParticipants((prev) => {
             if (prev.some((p) => p.id === msg.player_id)) return prev;
@@ -424,6 +456,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
           if (msg.clue_level) setOnlineClueLevel(msg.clue_level);
         } else if (msg.type === 'CLUE_REVEALED') {
           setOnlineClueLevel(msg.clue_level);
+          syncOnlineLiveState(sessionId);
         } else if (msg.type === 'NEW_BID') {
           setCurrentBid(msg.amount);
           setHighestBidderId(msg.player_id);
@@ -439,7 +472,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
         } else if (msg.type === 'ROUND_RESOLVED') {
           setRoundWinnerAnnounce(
             msg.winner_name
-              ? `🏆 ${msg.winner_name} remporte la carte pour $${msg.winning_amount} !`
+              ? `🏆 ${msg.winner_name} remporte la carte "${msg.item_name || ''}" pour $${msg.winning_amount} !`
               : 'Aucun gagnant pour cette manche'
           );
           if (winnerTimeoutRef.current) clearTimeout(winnerTimeoutRef.current);
@@ -447,7 +480,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
             setRoundWinnerAnnounce(null);
           }, 3000);
 
-          if (msg.winner_player_id === myPlayerId && typeof msg.winning_amount === 'number') {
+          if (msg.winner_player_id === myPlayerIdRef.current && typeof msg.winning_amount === 'number') {
             setUserBudget((prev) => Math.max(0, prev - msg.winning_amount));
           }
 
@@ -464,6 +497,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
           setCurrentBid(0);
           setHighestBidderName('Personne');
           setHighestBidderId(null);
+          syncOnlineLiveState(sessionId);
         } else if (msg.type === 'GAME_FINISHED') {
           onFinishMatch();
         }
@@ -476,7 +510,7 @@ export const AuctionLiveScreen: React.FC<AuctionLiveScreenProps> = ({
     return () => {
       cleanupWs();
     };
-  }, [isLocalMode, sessionId, myPlayerId, onFinishMatch]);
+  }, [isLocalMode, sessionId, onFinishMatch, syncOnlineLiveState]);
 
   // Online Place Bid
   const handleOnlinePlaceBid = async (amountToAddOrTotal: number, isAbsolute: boolean = false) => {

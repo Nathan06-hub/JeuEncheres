@@ -34,6 +34,15 @@ class WsTicketResponse(BaseModel):
     expires_in: int = WS_TICKET_TTL_SECONDS
 
 
+def _purge_expired_memory_tickets(now: float) -> None:
+    expired = [k for k, (_, exp) in _memory_ws_tickets.items() if now > exp]
+    for k in expired:
+        _memory_ws_tickets.pop(k, None)
+    if len(_memory_ws_tickets) > 2048:
+        oldest = next(iter(_memory_ws_tickets))
+        _memory_ws_tickets.pop(oldest, None)
+
+
 @router.post(
     "/ws-ticket",
     response_model=WsTicketResponse,
@@ -50,7 +59,9 @@ async def create_ws_ticket(current_user: User = Depends(get_current_user)) -> Ws
         except Exception as exc:
             logger.warning("Erreur stockage ticket Redis: %s", exc)
 
-    _memory_ws_tickets[ticket] = (current_user.id, time.monotonic() + WS_TICKET_TTL_SECONDS)
+    now = time.monotonic()
+    _purge_expired_memory_tickets(now)
+    _memory_ws_tickets[ticket] = (current_user.id, now + WS_TICKET_TTL_SECONDS)
     return WsTicketResponse(ticket=ticket)
 
 
@@ -74,15 +85,20 @@ async def _consume_ws_ticket(ticket: str) -> Optional[uuid.UUID]:
         except Exception as exc:
             logger.warning("Erreur validation ticket Redis: %s", exc)
 
+    now = time.monotonic()
+    _purge_expired_memory_tickets(now)
     if ticket in _memory_ws_tickets:
         uid, expires_at = _memory_ws_tickets.pop(ticket)
-        if time.monotonic() <= expires_at:
+        if now <= expires_at:
             return uid
     return None
 
 
 def _error_payload(exc: Exception) -> dict:
-    """Message d'erreur sûr : le détail n'est exposé que pour les erreurs métier (HTTPException)."""
+    """Message d'erreur sûr : le détail n'est exposé que pour les erreurs métier (DomainError / HTTPException)."""
+    from app.core.exceptions import DomainError
+    if isinstance(exc, DomainError):
+        return {"type": "ERROR", "code": exc.status_code, "message": str(exc.detail)}
     if isinstance(exc, HTTPException):
         return {"type": "ERROR", "code": exc.status_code, "message": str(exc.detail)}
     if isinstance(exc, (ValueError, TypeError, KeyError)):
@@ -112,8 +128,8 @@ async def _snapshot(session_uuid: uuid.UUID) -> dict | None:
 async def auction_websocket(
     websocket: WebSocket,
     session_id: str,
-    token: Optional[str] = Query(None),
     ticket: Optional[str] = Query(None),
+    token: Optional[str] = Query(None, include_in_schema=False),
 ):
     """📱 Écran 03 : WebSocket temps réel pour timer, révélation d'indices et enchères en direct."""
     try:
@@ -124,13 +140,16 @@ async def auction_websocket(
         return
 
     # Extraction depuis subprotocol si fourni
+    chosen_subprotocol: Optional[str] = None
     subprotocols = websocket.headers.get("sec-websocket-protocol", "")
     for proto in [p.strip() for p in subprotocols.split(",") if p.strip()]:
         if proto.startswith("ticket."):
             ticket = proto.split("ticket.", 1)[1]
+            chosen_subprotocol = proto
             break
         elif proto.startswith("bearer."):
             token = proto.split("bearer.", 1)[1]
+            chosen_subprotocol = proto
             break
 
     user_uuid: Optional[uuid.UUID] = None
@@ -139,11 +158,11 @@ async def auction_websocket(
         if user_uuid is None:
             await websocket.close(code=4401)
             return
-    elif token:
+    elif token and (chosen_subprotocol or settings.IS_DEVELOPMENT):
         try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-            user_uuid = uuid.UUID(str(payload.get("sub")))
-        except (jwt.PyJWTError, ValueError, TypeError):
+            from app.api.deps import decode_user_id
+            user_uuid = decode_user_id(token)
+        except Exception:
             await websocket.close(code=4401)
             return
     else:
@@ -151,6 +170,11 @@ async def auction_websocket(
         return
 
     async with AsyncSessionLocal() as session:
+        user_row = (await session.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
+        if user_row is not None and not user_row.is_active:
+            await websocket.close(code=4403)
+            return
+
         game = (await session.execute(select(GameSession).where(GameSession.id == session_uuid))).scalar_one_or_none()
         if not game:
             await websocket.close(code=4404)
@@ -167,7 +191,7 @@ async def auction_websocket(
             return
         own_player_id = own_player.id if own_player else None
 
-    await ws_manager.connect(session_id, websocket)
+    await ws_manager.connect(session_id, websocket, subprotocol=chosen_subprotocol)
 
     try:
         await websocket.send_json({
@@ -295,6 +319,6 @@ async def auction_websocket(
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        logger.error(f"WebSocket fatal error in {session_id}: {exc}")
+        logger.error("WebSocket fatal error in %s: %s", session_id, exc)
     finally:
         ws_manager.disconnect(session_id, websocket)

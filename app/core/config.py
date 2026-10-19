@@ -17,17 +17,22 @@ class Settings(BaseSettings):
 
     PROJECT_NAME: str = "Enchères & Drafts IA API"
     VERSION: str = "0.1.0"
-    ENVIRONMENT: str = "development"
-    DEBUG: bool = True
+    ENVIRONMENT: str = "production"
+    DEBUG: bool = False
+    SQL_ECHO: bool = False
     API_V1_STR: str = "/api/v1"
 
     # Security
     SECRET_KEY: str
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours default
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 14
     ALGORITHM: str = "HS256"
+    JWT_ISSUER: str = "encheres-drafts-api"
+    JWT_AUDIENCE: str = "encheres-drafts-client"
 
-    # CORS
-    BACKEND_CORS_ORIGINS: List[str] = ["*"]
+    # CORS & Proxy
+    BACKEND_CORS_ORIGINS: List[str] = []
+    TRUSTED_PROXY_HOSTS: List[str] = ["127.0.0.1", "::1"]
 
     # PostgreSQL Database
     POSTGRES_SERVER: str = "localhost"
@@ -53,12 +58,14 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: str | None = None
+    REDIS_SSL: bool = False
 
     @property
     def REDIS_URL(self) -> str:
+        scheme = "rediss" if self.REDIS_SSL else "redis"
         if self.REDIS_PASSWORD:
-            return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+            return f"{scheme}://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        return f"{scheme}://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
 
     # Google Gemini AI API
     GEMINI_API_KEY: str
@@ -67,15 +74,23 @@ class Settings(BaseSettings):
     # Game Economy & Draft Rules
     INITIAL_FREE_TOKENS: int = 3
     AI_DECK_CREATION_TOKEN_COST: int = 1
+    AI_DAILY_GLOBAL_GENERATION_CAP: int = 200
+    AI_GENERATE_RATE_LIMIT_PER_MIN: int = 3
+    MAX_ACTIVE_GAMES_PER_HOST: int = 3
     DEFAULT_STARTING_BUDGET: int = 1000
     DEFAULT_BID_TIMER_SECONDS: int = 15
     MAX_ROUNDS_PER_GAME: int = 10
 
     # Achats & publicités récompensées
-    # Tant qu'aucun vérificateur de reçu réel n'est branché, les crédits IAP / pub sont refusés,
-    # sauf si ce drapeau est explicitement activé (développement uniquement).
+    # Tant qu'aucun identifiant fournisseur n'est configuré, les crédits IAP / pub sont refusés (501 fail-closed),
+    # sauf si ALLOW_UNVERIFIED_PURCHASES=True en développement uniquement.
     ALLOW_UNVERIFIED_PURCHASES: bool = False
     REWARDED_AD_DAILY_CAP: int = 5
+    APPLE_IAP_VERIFY_URL: str = "https://api.storekit.itunes.apple.com"
+    APPLE_IAP_BEARER_TOKEN: str = ""
+    GOOGLE_PLAY_PACKAGE_NAME: str = ""
+    GOOGLE_PLAY_ACCESS_TOKEN: str = ""
+    ADMOB_SSV_SHARED_SECRET: str = ""
 
     # Limitation de débit (requêtes / fenêtre) sur les routes d'authentification
     AUTH_RATE_LIMIT_ATTEMPTS: int = 10
@@ -83,7 +98,7 @@ class Settings(BaseSettings):
 
     @property
     def IS_DEVELOPMENT(self) -> bool:
-        return self.ENVIRONMENT.strip().lower() == "development"
+        return self.ENVIRONMENT.strip().lower() in ("development", "test")
 
     @model_validator(mode="after")
     def _forbid_weak_secret_outside_development(self) -> "Settings":
@@ -107,6 +122,8 @@ class Settings(BaseSettings):
             raise ValueError("BACKEND_CORS_ORIGINS ne peut pas contenir '*' hors développement")
         if self.ALLOW_UNVERIFIED_PURCHASES:
             raise ValueError("ALLOW_UNVERIFIED_PURCHASES doit rester False hors développement")
+        if self.DEBUG:
+            raise ValueError("DEBUG doit rester False hors développement")
         return self
 
 

@@ -27,9 +27,18 @@ def _unauthorized(detail: str) -> HTTPException:
 def decode_user_id(token: str) -> uuid.UUID:
     """Décode le JWT et retourne l'UUID utilisateur ; lève 401 si le token est invalide."""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        return uuid.UUID(str(payload.get("sub")))
-    except (jwt.PyJWTError, ValueError, TypeError):
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+            options={"require": ["exp", "sub", "iss", "aud"]},
+        )
+        if payload.get("type", "access") != "access":
+            raise _unauthorized("Type de jeton invalide")
+        return uuid.UUID(str(payload["sub"]))
+    except (jwt.PyJWTError, ValueError, TypeError, KeyError):
         raise _unauthorized("Jeton d'authentification invalide ou expiré")
 
 
@@ -84,3 +93,29 @@ async def get_current_active_superuser(
             detail="Privilèges administrateur requis",
         )
     return current_user
+
+
+async def get_game_or_404(session: AsyncSession, session_id: uuid.UUID):
+    """Récupère une GameSession par son ID ou lève une HTTPException 404."""
+    from app.models.game import GameSession
+    game_res = await session.execute(select(GameSession).where(GameSession.id == session_id))
+    game = game_res.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Session d'enchères introuvable")
+    return game
+
+
+async def ensure_participant(session: AsyncSession, game, user: User) -> None:
+    """Vérifie que l'utilisateur est l'hôte ou un participant inscrit de la session."""
+    from app.models.game import GameSessionPlayer
+    if game.host_id == user.id:
+        return
+    row = (await session.execute(
+        select(GameSessionPlayer.id).where(
+            GameSessionPlayer.session_id == game.id,
+            GameSessionPlayer.user_id == user.id,
+        ).limit(1)
+    )).first()
+    if not row:
+        raise HTTPException(status_code=403, detail="Vous ne participez pas à cette partie")
+

@@ -25,53 +25,57 @@ from app.services.token_service import TokenService
 router = APIRouter()
 
 
+DEFAULT_TOKEN_PACKS = (
+    {
+        "sku": "pack_starter_5",
+        "title": "Pack Découverte",
+        "tokens_amount": 5,
+        "price_cents": 99,
+        "currency": "USD",
+        "is_best_value": False,
+        "badge_text": None,
+    },
+    {
+        "sku": "pack_popular_15",
+        "title": "Pack Populaire",
+        "tokens_amount": 15,
+        "price_cents": 249,
+        "currency": "USD",
+        "is_best_value": True,
+        "badge_text": "Meilleure Valeur",
+    },
+    {
+        "sku": "pack_pro_50",
+        "title": "Pack Maître",
+        "tokens_amount": 50,
+        "price_cents": 699,
+        "currency": "USD",
+        "is_best_value": False,
+        "badge_text": "Gros Volume",
+    },
+)
+
+
+async def seed_default_token_packs(session: AsyncSession) -> None:
+    """Initialise de manière idempotente le catalogue des packs de jetons au démarrage."""
+    res = await session.execute(select(TokenPack.sku))
+    existing_skus = set(res.scalars().all())
+    missing = [TokenPack(**p) for p in DEFAULT_TOKEN_PACKS if p["sku"] not in existing_skus]
+    if not missing:
+        return
+    session.add_all(missing)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+
+
 @router.get("/packs", response_model=List[TokenPackResponse], summary="📱 Écran 05 : Grille des packs de jetons payants ($0.99, $2.49, $6.99)")
 async def get_token_packs(session: AsyncSession = Depends(get_db)) -> Any:
-    """Catalogue des packs disponibles avec badges 'Meilleure Valeur'."""
+    """Catalogue des packs disponibles avec badges 'Meilleure Valeur' (lecture pure sans écriture)."""
     query = select(TokenPack).where(TokenPack.is_active.is_(True)).order_by(TokenPack.price_cents.asc())
     res = await session.execute(query)
-    packs = list(res.scalars().all())
-
-    # Seed default packs if table is empty
-    if not packs:
-        default_packs = [
-            TokenPack(
-                sku="pack_starter_5",
-                title="Pack Découverte",
-                tokens_amount=5,
-                price_cents=99,
-                currency="USD",
-                is_best_value=False,
-            ),
-            TokenPack(
-                sku="pack_popular_15",
-                title="Pack Populaire",
-                tokens_amount=15,
-                price_cents=249,
-                currency="USD",
-                is_best_value=True,
-                badge_text="Meilleure Valeur",
-            ),
-            TokenPack(
-                sku="pack_pro_50",
-                title="Pack Maître",
-                tokens_amount=50,
-                price_cents=699,
-                currency="USD",
-                is_best_value=False,
-                badge_text="Gros Volume",
-            ),
-        ]
-        session.add_all(default_packs)
-        try:
-            await session.commit()
-        except IntegrityError:
-            # Un autre worker a seedé les packs entre-temps (sku unique)
-            await session.rollback()
-        res = await session.execute(query)
-        packs = list(res.scalars().all())
-
-    return packs
+    return list(res.scalars().all())
 
 
 @router.post("/verify-iap", response_model=TokenTransactionResponse, summary="📱 Écran 05 : Validation d'achat In-App et attribution de jetons")
@@ -105,20 +109,6 @@ async def claim_rewarded_ad(
     session: AsyncSession = Depends(get_db),
 ) -> Any:
     await verify_rewarded_ad(payload.reward_token, payload.ad_network, str(current_user.id))
-
-    since = datetime.now(timezone.utc) - timedelta(hours=24)
-    claimed_today = (await session.execute(
-        select(func.count(TokenTransaction.id)).where(
-            TokenTransaction.user_id == current_user.id,
-            TokenTransaction.transaction_type == TokenTransactionType.REWARDED_AD,
-            TokenTransaction.created_at >= since,
-        )
-    )).scalar() or 0
-    if claimed_today >= settings.REWARDED_AD_DAILY_CAP:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Limite quotidienne de vidéos récompensées atteinte",
-        )
 
     tx = await TokenService.claim_rewarded_ad(
         session=session,

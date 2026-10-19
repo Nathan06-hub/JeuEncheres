@@ -26,11 +26,21 @@ TestingSessionLocal = sessionmaker(
 )
 
 @pytest_asyncio.fixture(scope="function")
-async def db_session():
+async def db_session(monkeypatch):
+    from app.core import database as db_mod
+    from app.api.v1.endpoints import auction_ws as ws_mod
+    from app.services import timer_manager as tm_mod
+
+    monkeypatch.setattr(db_mod, "AsyncSessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(ws_mod, "AsyncSessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(tm_mod, "AsyncSessionLocal", TestingSessionLocal)
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
     async with TestingSessionLocal() as session:
+        from app.api.v1.endpoints.shop import seed_default_token_packs
+        await seed_default_token_packs(session)
         yield session
     
     async with engine.begin() as conn:
@@ -39,8 +49,9 @@ async def db_session():
 @pytest_asyncio.fixture(scope="function")
 async def client(db_session: AsyncSession):
     from app.core.database import get_db
-    from app.core.rate_limit import _memory_hits
+    from app.core.rate_limit import _memory_hits, _memory_daily_counters
     _memory_hits.clear()
+    _memory_daily_counters.clear()
 
     async def override_get_db():
         async with TestingSessionLocal() as session:

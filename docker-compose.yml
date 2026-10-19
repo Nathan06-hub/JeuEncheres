@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ------------------------------------------------------------------
   # PostgreSQL avec l'extension pgvector
@@ -9,15 +7,15 @@ services:
     container_name: encheres_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: encheres_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}
+      POSTGRES_DB: ${POSTGRES_DB:-encheres_db}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -29,18 +27,19 @@ services:
     image: redis:7-alpine
     container_name: encheres_redis
     restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD requis}"]
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD requis}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   # ------------------------------------------------------------------
-  # Backend FastAPI (Python 3.11, async)
+  # Backend FastAPI (Python 3.11, async)
   # ------------------------------------------------------------------
   encheres_backend:
     build:
@@ -54,20 +53,22 @@ services:
       encheres_redis:
         condition: service_healthy
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:?ENVIRONMENT requis}
+      - DEBUG=${DEBUG:-False}
+      - SQL_ECHO=${SQL_ECHO:-False}
       - POSTGRES_SERVER=encheres_postgres
       - POSTGRES_PORT=5432
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=encheres_db
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}
+      - POSTGRES_DB=${POSTGRES_DB:-encheres_db}
       - REDIS_HOST=encheres_redis
       - REDIS_PORT=6379
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - SECRET_KEY=${SECRET_KEY:-change_this_to_a_super_secret_key_in_production_min_32_chars}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD requis}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY requis}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY requis}
     ports:
-      - "8000:8000"
-    volumes:
-      - ./app:/app/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - "127.0.0.1:8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 5s

@@ -138,7 +138,33 @@ class TokenService:
         reward_token: str,
         ad_network: str,
     ) -> TokenTransaction:
-        """Credit 1 free token after rewarded video ad."""
+        """Credit 1 free token after rewarded video ad, enforcing daily cap under row lock."""
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import func
+
+        # Verrouille la ligne utilisateur avant le comptage journalier pour éviter la course (F-07)
+        user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = user_res.scalar_one_or_none()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        claimed_today = (await session.execute(
+            select(func.count(TokenTransaction.id)).where(
+                TokenTransaction.user_id == user_id,
+                TokenTransaction.transaction_type == TokenTransactionType.REWARDED_AD,
+                TokenTransaction.created_at >= since,
+            )
+        )).scalar() or 0
+        if claimed_today >= settings.REWARDED_AD_DAILY_CAP:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Limite quotidienne de vidéos récompensées atteinte",
+            )
+
         return await cls.modify_token_balance(
             session=session,
             user_id=user_id,

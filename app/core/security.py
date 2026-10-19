@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import jwt
@@ -7,14 +8,38 @@ from app.core.config import settings
 
 
 def create_access_token(subject: str | Any, expires_delta: timedelta | None = None) -> str:
-    """Generate signed JWT access token."""
+    """Generate signed JWT access token with standard security claims (iat, jti, iss, aud, type)."""
+    now = datetime.now(timezone.utc)
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode = {"exp": expire, "sub": str(subject)}
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
+        expire = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {
+        "exp": expire,
+        "iat": now,
+        "jti": uuid.uuid4().hex,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "sub": str(subject),
+        "type": "access",
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_refresh_token(subject: str | Any, expires_delta: timedelta | None = None) -> str:
+    """Generate signed JWT refresh token with type='refresh'."""
+    now = datetime.now(timezone.utc)
+    expire = now + (expires_delta or timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS))
+    to_encode = {
+        "exp": expire,
+        "iat": now,
+        "jti": uuid.uuid4().hex,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "sub": str(subject),
+        "type": "refresh",
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import uuid
 from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
+from app.core.rate_limit import rate_limit
 from app.api.deps import get_current_user, get_current_user_optional
 from app.models.user import User
 from app.models.deck import Deck, DeckCategory, DeckItem
@@ -73,7 +74,12 @@ async def get_popular_decks(
     return decks
 
 
-@router.post("/quick-game", response_model=GameSessionResponse, summary="📱 Ecran 01 : Lancement Partie Rapide (Local / Pass & Play)")
+@router.post(
+    "/quick-game",
+    response_model=GameSessionResponse,
+    summary="📱 Ecran 01 : Lancement Partie Rapide (Local / Pass & Play)",
+    dependencies=[Depends(rate_limit("quick-game", attempts=5, window=60))],
+)
 async def launch_quick_game(
     deck_id: Optional[uuid.UUID] = None,
     session: AsyncSession = Depends(get_db),
