@@ -201,6 +201,9 @@ async def test_shop_packs_iap_and_rewarded_ad_flows(
     monkeypatch,
 ):
     """Test complet de /api/v1/shop/packs, verify-iap, claim-rewarded-ad et transactions."""
+    from unittest.mock import AsyncMock
+    from app.services import receipt_verifier as verifier_mod
+
     headers = await _auth_headers(client)
 
     # 1. GET /shop/packs (seed automatique des 3 packs)
@@ -209,7 +212,8 @@ async def test_shop_packs_iap_and_rewarded_ad_flows(
     packs = packs_resp.json()
     assert len(packs) == 3
 
-    # 2. En mode fail-closed par défaut (ALLOW_UNVERIFIED_PURCHASES=False), verify-iap et rewarded-ad renvoient 501
+    # 2. En mode fail-closed par défaut, les paiements ne sont pas vérifiés,
+    #    et le client ne peut pas réclamer directement une récompense AdMob.
     monkeypatch.setattr(settings, "ALLOW_UNVERIFIED_PURCHASES", False)
     iap_closed = await client.post(
         "/api/v1/shop/verify-iap",
@@ -228,11 +232,13 @@ async def test_shop_packs_iap_and_rewarded_ad_flows(
         headers=headers,
         json={"reward_token": "reward_tok_12345", "ad_network": "AdMob"},
     )
-    assert ad_closed.status_code == 501
+    assert ad_closed.status_code == 410
 
-    # 3. En mode développement avec ALLOW_UNVERIFIED_PURCHASES=True, le crédit et l'idempotence fonctionnent
+    # 3. Le mode dev peut toujours bypasser la vérification IAP; les récompenses
+    #    restent exclusivement créditées par le callback SSV serveur.
     monkeypatch.setattr(settings, "ENVIRONMENT", "development")
     monkeypatch.setattr(settings, "ALLOW_UNVERIFIED_PURCHASES", True)
+    monkeypatch.setattr(verifier_mod, "consume_google_purchase", AsyncMock(return_value=True))
 
     tx_id = f"tx_dev_{uuid.uuid4().hex[:10]}"
     iap_ok = await client.post(
@@ -253,13 +259,12 @@ async def test_shop_packs_iap_and_rewarded_ad_flows(
         headers=headers,
         json={"reward_token": f"rw_{uuid.uuid4().hex[:8]}", "ad_network": "AdMob"},
     )
-    assert ad_ok.status_code == 200, ad_ok.text
-    assert ad_ok.json()["amount"] == 1
+    assert ad_ok.status_code == 410, ad_ok.text
 
     # 4. Historique des transactions
     hist = await client.get("/api/v1/shop/transactions", headers=headers)
     assert hist.status_code == 200
-    assert len(hist.json()) >= 3  # INITIAL_GIFT + IAP + REWARDED_AD
+    assert len(hist.json()) >= 2  # INITIAL_GIFT + IAP
 
 
 @pytest.mark.asyncio
@@ -529,6 +534,15 @@ async def test_sprint4_jwt_strict_claims_refresh_and_csp(client: httpx.AsyncClie
     )
     assert refresh_resp.status_code == 200
     assert "access_token" in refresh_resp.json()
+    rotated = refresh_resp.json()["refresh_token"]
+    replay_resp = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": tokens["refresh_token"]},
+    )
+    assert replay_resp.status_code == 401
+    assert (await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": rotated}
+    )).status_code == 200
 
     # Un access_token ne peut pas servir de refresh_token -> 401
     bad_refresh = await client.post(
@@ -540,20 +554,23 @@ async def test_sprint4_jwt_strict_claims_refresh_and_csp(client: httpx.AsyncClie
 
 @pytest.mark.asyncio
 async def test_sprint5_receipt_verifier_apple_google_and_admob(monkeypatch):
-    """H-01 : vérification unitaire de _verify_apple, _verify_google et _verify_ad_ssv."""
-    import hashlib
-    import hmac
+    """Vérifie les claims de paiement et la signature ECDSA officielle AdMob."""
+    import base64
+    import time
     from fastapi import HTTPException
-    from app.services.receipt_verifier import (
-        verify_store_receipt,
-        verify_rewarded_ad,
-    )
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from app.services import receipt_verifier as verifier_mod
+    from app.services.receipt_verifier import verify_store_receipt, verify_admob_callback
 
     monkeypatch.setattr(settings, "ALLOW_UNVERIFIED_PURCHASES", False)
     monkeypatch.setattr(settings, "APPLE_IAP_BEARER_TOKEN", "apple_test_bearer")
     monkeypatch.setattr(settings, "GOOGLE_PLAY_PACKAGE_NAME", "com.encheres.app")
     monkeypatch.setattr(settings, "GOOGLE_PLAY_ACCESS_TOKEN", "google_test_token")
-    monkeypatch.setattr(settings, "ADMOB_SSV_SHARED_SECRET", "admob_secret_key_test")
+    monkeypatch.setattr(settings, "APPLE_BUNDLE_ID", "com.encheres.app")
+    monkeypatch.setattr(settings, "APPLE_IAP_VERIFY_URL", "https://apple.test")
+    monkeypatch.setattr(settings, "APPLE_ENVIRONMENT", "Production")
 
     class _DummyResponse:
         def __init__(self, status_code: int, payload: dict):
@@ -580,17 +597,35 @@ async def test_sprint5_receipt_verifier_apple_google_and_admob(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _DummyAsyncClient)
 
-    # 1. Apple IAP : succès (200 + productId correspondant) puis échec (SKU mismatch -> 402)
-    responses.append(_DummyResponse(200, {"productId": "pack_starter_5"}))
+    # 1. Apple IAP : le JWS doit être vérifié et ses identifiants doivent correspondre.
+    class _Verifier:
+        def __init__(self, product_id: str):
+            self.product_id = product_id
+
+        def verify_and_decode_signed_transaction(self, _signed: str):
+            return SimpleNamespace(
+                transactionId="tx_1",
+                productId=self.product_id,
+                bundleId="com.encheres.app",
+                revocationDate=None,
+            )
+
+    monkeypatch.setattr(verifier_mod, "_apple_api_token", lambda: "apple_test_bearer")
+    monkeypatch.setattr(verifier_mod, "_apple_verifier", lambda: _Verifier("pack_starter_5"))
+    responses.append(_DummyResponse(200, {"signedTransactionInfo": "verified-jws"}))
     await verify_store_receipt("ios", "tx_1", "receipt_abc", "pack_starter_5")
 
-    responses.append(_DummyResponse(200, {"productId": "other_sku"}))
+    monkeypatch.setattr(verifier_mod, "_apple_verifier", lambda: _Verifier("other_sku"))
+    responses.append(_DummyResponse(200, {"signedTransactionInfo": "verified-jws"}))
     with pytest.raises(HTTPException) as exc_apple:
         await verify_store_receipt("ios", "tx_2", "receipt_abc", "pack_starter_5")
     assert exc_apple.value.status_code == 402
 
-    # 2. Google Play IAP : succès (purchaseState=0) puis échec (purchaseState=1 -> 402)
-    responses.append(_DummyResponse(200, {"purchaseState": 0, "orderId": "gpa_1"}))
+    # 2. Google Play IAP : produit, achat, token et commande concordent.
+    responses.append(_DummyResponse(200, {
+        "purchaseState": 0, "orderId": "gpa_1", "productId": "pack_starter_5",
+        "purchaseToken": "tok_xyz", "quantity": 1,
+    }))
     await verify_store_receipt("android", "gpa_1", "tok_xyz", "pack_starter_5")
 
     responses.append(_DummyResponse(200, {"purchaseState": 1, "orderId": "gpa_2"}))
@@ -603,18 +638,25 @@ async def test_sprint5_receipt_verifier_apple_google_and_admob(monkeypatch):
         await verify_store_receipt("windows_phone", "tx_3", "receipt", "pack_starter_5")
     assert exc_plat.value.status_code == 400
 
-    # 3. AdMob SSV : signature HMAC valide vs falsifiée
+    # 3. AdMob SSV : ECDSA sur les octets exacts du query string.
     uid = str(uuid.uuid4())
-    nonce = "nonce12345"
-    sig = hmac.new(
-        b"admob_secret_key_test",
-        f"{uid}:admob:{nonce}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    await verify_rewarded_ad(f"{nonce}:{sig}", "AdMob", uid)
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = private_key.public_key()
+    async def _keys():
+        return {123: public_key}
+    monkeypatch.setattr(verifier_mod, "_get_admob_keys", _keys)
+    payload = (
+        f"ad_network=5450213213286189855&ad_unit=unit-1&reward_amount=1&reward_item=token"
+        f"&timestamp={int(time.time() * 1000)}&transaction_id=reward-1&user_id={uid}"
+    )
+    signature = private_key.sign(payload.encode("ascii"), ec.ECDSA(hashes.SHA256()))
+    signature_text = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    callback = f"{payload}&signature={signature_text}&key_id=123"
+    claims = await verify_admob_callback(callback.encode("ascii"))
+    assert claims == {"transaction_id": "reward-1", "user_id": uid}
 
     with pytest.raises(HTTPException) as exc_ad:
-        await verify_rewarded_ad(f"{nonce}:deadbeef", "AdMob", uid)
+        await verify_admob_callback(callback.replace("reward_amount=1", "reward_amount=2").encode("ascii"))
     assert exc_ad.value.status_code == 403
 
 

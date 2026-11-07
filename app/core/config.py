@@ -1,4 +1,5 @@
 from typing import List
+from sqlalchemy.engine import URL, make_url
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -45,13 +46,18 @@ class Settings(BaseSettings):
     @property
     def ASYNC_DATABASE_URI(self) -> str:
         if self.DATABASE_URL:
-            if self.DATABASE_URL.startswith("postgresql://"):
-                return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-            return self.DATABASE_URL
-        return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
-        )
+            url = make_url(self.DATABASE_URL)
+            if url.drivername == "postgresql":
+                url = url.set(drivername="postgresql+asyncpg")
+            return url.render_as_string(hide_password=False)
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            host=self.POSTGRES_SERVER,
+            port=self.POSTGRES_PORT,
+            database=self.POSTGRES_DB,
+        ).render_as_string(hide_password=False)
 
     # Redis Cache & Real-time
     REDIS_HOST: str = "localhost"
@@ -62,10 +68,14 @@ class Settings(BaseSettings):
 
     @property
     def REDIS_URL(self) -> str:
-        scheme = "rediss" if self.REDIS_SSL else "redis"
-        if self.REDIS_PASSWORD:
-            return f"{scheme}://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"{scheme}://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        return URL.create(
+            "rediss" if self.REDIS_SSL else "redis",
+            username="" if self.REDIS_PASSWORD else None,
+            password=self.REDIS_PASSWORD,
+            host=self.REDIS_HOST,
+            port=self.REDIS_PORT,
+            database=str(self.REDIS_DB),
+        ).render_as_string(hide_password=False)
 
     # Google Gemini AI API
     GEMINI_API_KEY: str
@@ -88,9 +98,19 @@ class Settings(BaseSettings):
     REWARDED_AD_DAILY_CAP: int = 5
     APPLE_IAP_VERIFY_URL: str = "https://api.storekit.itunes.apple.com"
     APPLE_IAP_BEARER_TOKEN: str = ""
+    APPLE_IAP_PRIVATE_KEY: str = ""
+    APPLE_IAP_KEY_ID: str = ""
+    APPLE_IAP_ISSUER_ID: str = ""
+    APPLE_BUNDLE_ID: str = ""
+    APPLE_APP_ID: str = ""
+    APPLE_ENVIRONMENT: str = "Production"
+    APPLE_ROOT_CERTIFICATES_B64: str = ""
     GOOGLE_PLAY_PACKAGE_NAME: str = ""
     GOOGLE_PLAY_ACCESS_TOKEN: str = ""
-    ADMOB_SSV_SHARED_SECRET: str = ""
+    GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: str = ""
+    ADMOB_REWARD_ITEM: str = "token"
+    ADMOB_REWARD_AMOUNT: int = 1
+    ADMOB_ALLOWED_AD_UNIT: str = ""
 
     # Limitation de débit (requêtes / fenêtre) sur les routes d'authentification
     AUTH_RATE_LIMIT_ATTEMPTS: int = 10

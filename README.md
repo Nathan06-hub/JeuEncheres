@@ -64,7 +64,7 @@ Le projet suit les principes de la **Clean Architecture** et du **Domain-Driven 
 | **02_Creation_IA** | `GET /api/v1/creation-ai/suggestions`<br>`POST /api/v1/creation-ai/generate` | Chips de suggestions, saisie libre d'un sujet, déduction atomique d'1 jeton et génération Gemini (3 indices + scores 1-100 + embeddings). |
 | **03_Enchere** | `GET /api/v1/auction/sessions/{id}/live-state`<br>`POST /api/v1/auction/sessions/{id}/bid`<br>`POST /api/v1/auction/sessions/{id}/advance` | Timer en direct, manche active, révélation progressive des indices (1->2->3), soumission des enchères et passage. |
 | **04_Resultats** | `GET /api/v1/results/sessions/{id}/results` | Podium des vainqueurs, composition d'équipe de chaque joueur, calcul des bonus de synergie IA et indicateur de ROI. |
-| **05_Boutique** | `GET /api/v1/shop/packs`<br>`POST /api/v1/shop/verify-iap`<br>`POST /api/v1/shop/claim-rewarded-ad`<br>`GET /api/v1/shop/transactions` | Grille des packs ($0.99, $2.49 "Meilleure Valeur", $6.99), validation d'achat In-App, +1 jeton gratuit via vidéo publicitaire. |
+| **05_Boutique** | `GET /api/v1/shop/packs`<br>`POST /api/v1/shop/verify-iap`<br>`GET /api/v1/shop/admob-ssv` (callback serveur AdMob)<br>`GET /api/v1/shop/transactions` | Grille des packs ($0.99, $2.49 "Meilleure Valeur", $6.99), validation serveur des achats et attribution des récompenses via callback SSV signé. |
 
 ---
 
@@ -93,8 +93,19 @@ cp .env.example .env
 
 ### 4. Lancement du Serveur de Développement
 ```bash
+# Appliquer les migrations avant le premier lancement et après chaque mise à jour
+alembic upgrade head
+
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+Le service backend de `docker compose` applique les migrations avant de démarrer l’API.
+
+### Vérification des achats et récompenses
+
+- **Apple :** configurer l’identifiant de bundle, l’ID d’app Apple en production, la clé privée App Store Connect (ou un bearer JWT court), son `KEY_ID`/`ISSUER_ID`, et les certificats racines Apple encodés en Base64 dans `APPLE_ROOT_CERTIFICATES_B64` (séparés par des virgules). `APPLE_ENVIRONMENT` choisit `Production` ou `Sandbox`.
+- **Google Play :** fournir un compte de service à portée Android Publisher via `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` (recommandé) ou un access token renouvelé automatiquement par votre gestionnaire de secrets. Les achats de jetons sont consommés côté serveur après attribution.
+- **AdMob :** configurer l’URL SSV de l’unité publicitaire vers `https://<hôte>/api/v1/shop/admob-ssv`, passer l’UUID utilisateur à l’SDK AdMob et faire correspondre `ADMOB_REWARD_ITEM`, `ADMOB_REWARD_AMOUNT` et, si souhaité, `ADMOB_ALLOWED_AD_UNIT` aux paramètres de l’unité.
 
 - **Documentation Swagger UI** : [http://localhost:8000/api/v1/docs](http://localhost:8000/api/v1/docs)
 - **Documentation ReDoc** : [http://localhost:8000/api/v1/redoc](http://localhost:8000/api/v1/redoc)

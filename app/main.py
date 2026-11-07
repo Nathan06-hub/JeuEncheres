@@ -50,9 +50,12 @@ async def lifespan(app: FastAPI):
             raise  # hors développement : mieux vaut ne pas démarrer qu'être « healthy » sans base
 
     try:
-        await init_redis_pool()
+        redis_client = await init_redis_pool()
+        await redis_client.ping()
     except Exception:
         logger.exception("Could not connect to Redis pool")
+        if not settings.IS_DEVELOPMENT:
+            raise
 
     try:
         from app.core.database import AsyncSessionLocal

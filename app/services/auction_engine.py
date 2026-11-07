@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.models.game import GameSession, GameSessionPlayer, GameStatus, GameMode
 from app.models.deck import Deck, DeckItem
 from app.models.bid import Bid, DraftedItem
+from app.models.user import User
 
 _ROOM_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 _ROOM_CODE_LENGTH = 8
@@ -92,10 +93,15 @@ class AuctionEngine:
 
         # Plafond de parties actives par hôte (E-02)
         if host_user_id is not None:
+            # Sérialise les créations de cet hôte afin que deux requêtes simultanées
+            # ne dépassent pas le plafond après avoir lu le même compteur.
+            await session.execute(
+                select(User.id).where(User.id == host_user_id).with_for_update()
+            )
             active_count_res = await session.execute(
                 select(func.count(GameSession.id)).where(
                     GameSession.host_id == host_user_id,
-                    GameSession.status == GameStatus.ROUND_BIDDING,
+                    GameSession.status.in_((GameStatus.LOBBY, GameStatus.IN_PROGRESS, GameStatus.ROUND_BIDDING)),
                 )
             )
             active_count = active_count_res.scalar() or 0

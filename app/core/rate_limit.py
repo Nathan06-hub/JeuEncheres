@@ -34,11 +34,22 @@ async def _hit_redis(key: str, window: int) -> int | None:
 
     client = redis_module.redis_client
     if client is None:
+        if not settings.IS_DEVELOPMENT:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Le stockage partagé des limites de débit est indisponible",
+            )
         return None
     try:
         count = await client.eval(_LUA_INCR_EXPIRE, 1, key, window)
         return int(count)
     except Exception as exc:
+        if not settings.IS_DEVELOPMENT:
+            logger.error("Rate limit Redis indisponible en production: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Le stockage partagé des limites de débit est indisponible",
+            ) from exc
         logger.warning("Rate limit Redis indisponible: %s", exc)
         return None
 

@@ -66,9 +66,24 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD requis}
       - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY requis}
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY requis}
+      - APPLE_IAP_PRIVATE_KEY=${APPLE_IAP_PRIVATE_KEY:-}
+      - APPLE_IAP_KEY_ID=${APPLE_IAP_KEY_ID:-}
+      - APPLE_IAP_ISSUER_ID=${APPLE_IAP_ISSUER_ID:-}
+      - APPLE_IAP_BEARER_TOKEN=${APPLE_IAP_BEARER_TOKEN:-}
+      - APPLE_IAP_VERIFY_URL=${APPLE_IAP_VERIFY_URL:-https://api.storekit.itunes.apple.com}
+      - APPLE_BUNDLE_ID=${APPLE_BUNDLE_ID:-}
+      - APPLE_APP_ID=${APPLE_APP_ID:-}
+      - APPLE_ENVIRONMENT=${APPLE_ENVIRONMENT:-Production}
+      - APPLE_ROOT_CERTIFICATES_B64=${APPLE_ROOT_CERTIFICATES_B64:-}
+      - GOOGLE_PLAY_PACKAGE_NAME=${GOOGLE_PLAY_PACKAGE_NAME:-}
+      - GOOGLE_PLAY_ACCESS_TOKEN=${GOOGLE_PLAY_ACCESS_TOKEN:-}
+      - GOOGLE_PLAY_SERVICE_ACCOUNT_JSON=${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON:-}
+      - ADMOB_REWARD_ITEM=${ADMOB_REWARD_ITEM:-token}
+      - ADMOB_REWARD_AMOUNT=${ADMOB_REWARD_AMOUNT:-1}
+      - ADMOB_ALLOWED_AD_UNIT=${ADMOB_ALLOWED_AD_UNIT:-}
     ports:
       - "127.0.0.1:8000:8000"
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 5s

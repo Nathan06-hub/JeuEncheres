@@ -41,6 +41,11 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         String(255),
         nullable=True,
     )
+    refresh_token_jti: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        doc="Identifiant du seul refresh token actuellement valide (rotation à usage unique)",
+    )
     avatar_url: Mapped[str | None] = mapped_column(
         String(512),
         nullable=True,

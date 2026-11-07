@@ -26,9 +26,13 @@ def _hash_secret(secret: str) -> str:
 
 
 def _token_response(user: User) -> dict[str, Any]:
+    access_token = create_access_token(subject=str(user.id))
+    refresh_token = create_refresh_token(subject=str(user.id))
+    refresh_jti = jwt.decode(refresh_token, options={"verify_signature": False})["jti"]
+    user.refresh_token_jti = refresh_jti
     return {
-        "access_token": create_access_token(subject=str(user.id)),
-        "refresh_token": create_refresh_token(subject=str(user.id)),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     }
@@ -192,7 +196,7 @@ async def refresh_access_token(
             algorithms=[settings.ALGORITHM],
             audience=settings.JWT_AUDIENCE,
             issuer=settings.JWT_ISSUER,
-            options={"require": ["exp", "sub", "iss", "aud"]},
+            options={"require": ["exp", "sub", "iss", "aud", "jti"]},
         )
         if decoded.get("type") != "refresh":
             raise ValueError("Not a refresh token")
@@ -203,12 +207,18 @@ async def refresh_access_token(
             detail="Jeton de rafraîchissement invalide ou expiré",
         )
 
-    user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    user = (await session.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    )).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Utilisateur introuvable ou inactif",
         )
+    if not user.refresh_token_jti or not hmac.compare_digest(
+        user.refresh_token_jti, str(decoded.get("jti", ""))
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Jeton déjà renouvelé ou révoqué")
     return _token_response(user)
 
 

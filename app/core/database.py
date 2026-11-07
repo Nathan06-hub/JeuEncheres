@@ -7,13 +7,27 @@ from sqlalchemy.ext.asyncio import (
 )
 from app.core.config import settings
 
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_sqlite(type_, compiler, **kw):
+    return "JSON"
+
+
+_is_sqlite = settings.ASYNC_DATABASE_URI.startswith("sqlite")
+_engine_kwargs = (
+    {"connect_args": {"check_same_thread": False}}
+    if _is_sqlite
+    else {"pool_pre_ping": True, "pool_size": 20, "max_overflow": 10}
+)
+
 # Engine with connection pooling
 engine = create_async_engine(
     settings.ASYNC_DATABASE_URI,
     echo=settings.SQL_ECHO,
-    pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=10,
+    **_engine_kwargs,
 )
 
 # Async session factory
@@ -27,10 +41,14 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def init_db_extensions() -> None:
-    """Initialize required PostgreSQL extensions (pgvector & uuid-ossp)."""
+    """Initialize required PostgreSQL extensions (pgvector & uuid-ossp) or local SQLite tables."""
     async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'))
+        if _is_sqlite:
+            from app.models.base import Base
+            await conn.run_sync(Base.metadata.create_all)
+        else:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+            await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'))
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
